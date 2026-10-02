@@ -51,6 +51,11 @@ CodeCoverage/
 [Tt]est[Rr]esult*/
 [Bb]uild[Ll]og.*
 
+# Workspace-local SDK and NuGet caches
+.tools/
+.dotnet-cli/
+.nuget/
+
 # NUnit
 *.VisualState.xml
 TestResult.xml
