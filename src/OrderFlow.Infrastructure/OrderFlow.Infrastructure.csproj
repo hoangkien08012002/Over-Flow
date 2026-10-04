@@ -1,5 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <ItemGroup>
+    <PackageReference Include="Microsoft.EntityFrameworkCore.SqlServer" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Design" PrivateAssets="all" />
+    <PackageReference Include="Microsoft.AspNetCore.Identity.EntityFrameworkCore" />
     <ProjectReference Include="../OrderFlow.Application/OrderFlow.Application.csproj" />
     <ProjectReference Include="../OrderFlow.Domain/OrderFlow.Domain.csproj" />
   </ItemGroup>

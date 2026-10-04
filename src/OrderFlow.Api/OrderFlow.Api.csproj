@@ -1,5 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk.Web">
   <ItemGroup>
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Design" PrivateAssets="all" />
     <ProjectReference Include="../OrderFlow.Application/OrderFlow.Application.csproj" />
     <ProjectReference Include="../OrderFlow.Infrastructure/OrderFlow.Infrastructure.csproj" />
   </ItemGroup>
