@@ -14,6 +14,7 @@ public sealed class OrderFlowDbContext(DbContextOptions<OrderFlowDbContext> opti
     public DbSet<Product> Products => Set<Product>();
     public DbSet<Inventory> Inventories => Set<Inventory>();
     public DbSet<InventoryAdjustment> InventoryAdjustments => Set<InventoryAdjustment>();
+    public DbSet<RefreshToken> RefreshTokens => Set<RefreshToken>();
 
     protected override void OnModelCreating(ModelBuilder builder)
     {
@@ -26,6 +27,7 @@ public sealed class OrderFlowDbContext(DbContextOptions<OrderFlowDbContext> opti
             user.Property(x => x.IsActive).HasDefaultValue(true);
             user.Property(x => x.CreatedAtUtc).IsRequired();
         });
+        builder.Entity<ApplicationUser>().HasIndex(x => x.NormalizedEmail).IsUnique().HasDatabaseName("EmailIndex").HasFilter("[NormalizedEmail] IS NOT NULL");
 
         SeedRoles(builder);
     }

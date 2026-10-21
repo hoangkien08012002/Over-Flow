@@ -17,6 +17,6 @@ jobs:
       - name: Build
         run: dotnet build OrderFlow.sln --no-restore --configuration Release
       - name: Test
-        run: dotnet test OrderFlow.sln --no-build --configuration Release
+        run: dotnet test --solution OrderFlow.sln --no-build --configuration Release --minimum-expected-tests 9
       - name: Validate Compose
         run: docker compose --env-file .env.example config --quiet

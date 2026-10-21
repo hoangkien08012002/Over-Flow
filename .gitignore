@@ -56,6 +56,9 @@ CodeCoverage/
 .dotnet-cli/
 .nuget/
 
+# Visual Studio workspace state
+.vs/
+
 # NUnit
 *.VisualState.xml
 TestResult.xml

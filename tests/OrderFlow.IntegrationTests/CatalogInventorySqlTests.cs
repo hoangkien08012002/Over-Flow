@@ -16,7 +16,7 @@ public sealed class CatalogInventorySqlTests
         {
             Assert.Equal(4, await db.Roles.CountAsync(TestContext.Current.CancellationToken));
             Assert.True(await db.Database.CanConnectAsync(TestContext.Current.CancellationToken));
-            Assert.Single(await db.Database.GetAppliedMigrationsAsync(TestContext.Current.CancellationToken));
+            Assert.Equal(2, (await db.Database.GetAppliedMigrationsAsync(TestContext.Current.CancellationToken)).Count());
         });
     }
 
