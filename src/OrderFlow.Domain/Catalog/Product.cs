@@ -16,11 +16,11 @@ public sealed class Product
     public DateTimeOffset UpdatedAtUtc { get; private set; }
     public byte[] RowVersion { get; private set; } = [];
 
-    public static Product Create(Guid id, Guid categoryId, string sku, string name, string? description, decimal price, string currencyCode, DateTimeOffset now)
+    public static Product Create(Guid id, Guid categoryId, string sku, string name, string? description, decimal price, string currencyCode, DateTimeOffset now, bool isActive = true)
     {
         ArgumentOutOfRangeException.ThrowIfEqual(id, Guid.Empty);
         Validate(categoryId, sku, name, description, price, currencyCode, now);
-        return new Product { Id = id, CategoryId = categoryId, Sku = sku.Trim(), Name = name.Trim(), Description = description?.Trim(), Price = price, CurrencyCode = currencyCode, IsActive = true, CreatedAtUtc = now, UpdatedAtUtc = now };
+        return new Product { Id = id, CategoryId = categoryId, Sku = sku.Trim(), Name = name.Trim(), Description = description?.Trim(), Price = price, CurrencyCode = currencyCode, IsActive = isActive, CreatedAtUtc = now, UpdatedAtUtc = now };
     }
 
     public void Update(Guid categoryId, string sku, string name, string? description, decimal price, string currencyCode, DateTimeOffset now)

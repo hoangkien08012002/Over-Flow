@@ -136,6 +136,8 @@ app.MapPost("/api/v1/auth/logout", async (RefreshRequest request, Authentication
     return Results.NoContent();
 }).AllowAnonymous().RequireRateLimiting("logout");
 
+app.MapCatalogEndpoints();
+
 app.Run();
 
 public sealed record RegisterRequest(string Email, string Password, string FirstName, string LastName);
