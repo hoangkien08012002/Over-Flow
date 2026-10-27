@@ -6,7 +6,9 @@
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="xunit.v3.mtp-v2" />
+    <PackageReference Include="Microsoft.AspNetCore.Mvc.Testing" />
     <ProjectReference Include="../../src/OrderFlow.Api/OrderFlow.Api.csproj" />
     <ProjectReference Include="../../src/OrderFlow.Worker/OrderFlow.Worker.csproj" />
+    <ProjectReference Include="../../src/OrderFlow.Infrastructure/OrderFlow.Infrastructure.csproj" />
   </ItemGroup>
 </Project>
