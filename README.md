@@ -1,6 +1,6 @@
 # OrderFlow
 
-OrderFlow is a .NET 10 modular-monolith backend for reliable e-commerce order processing. This repository contains the Phase 1 solution foundation, Phase 2 domain and persistence foundation, and Phase 3 identity and access slice.
+OrderFlow is a .NET 10 modular-monolith backend for reliable e-commerce order processing. Phases 1–5 cover solution foundation, persistence, identity, catalog, and inventory concurrency.
 
 ## Prerequisites
 
@@ -19,7 +19,7 @@ The solution contains `Domain`, `Application`, `Infrastructure`, `Api`, and `Wor
 
 In Visual Studio 2026, open `OrderFlow.sln`, restore NuGet packages, select `OrderFlow.Api` as the startup project, and run its `OrderFlow.Api` launch profile. Configure the SQL connection and JWT environment variables described below before starting the API. The Worker is a separate executable and can be selected as another startup project when needed.
 
-Phase 2 adds Category, Product, Inventory, and immutable InventoryAdjustment domain behavior, an Identity-aware `OrderFlowDbContext`, SQL Server mappings, constraints, rowversion concurrency, and the initial migration. Catalog HTTP endpoints and inventory reservations are later slices.
+Phase 2 adds Category, Product, Inventory, and immutable InventoryAdjustment domain behavior, an Identity-aware `OrderFlowDbContext`, SQL Server mappings, constraints, rowversion concurrency, and the initial migration. Phase 4 adds catalog endpoints. Phase 5 adds audited adjustment, SQL-backed reservations, low-stock outbox records, and an expiry job interface. Checkout and Kafka processing follow in later phases.
 
 ## Local dependencies
 
@@ -35,7 +35,7 @@ docker compose --env-file .env down
 
 From the host, SQL Server is at `localhost:1433`, Redis at `localhost:6379`, and Kafka at `localhost:9092` unless the ports are changed in `.env`. Containers can reach them at `sqlserver:1433`, `redis:6379`, and `kafka:19092`. Compose binds the exposed ports to loopback for local development. SQL Server and Redis use named volumes; Kafka data is ephemeral in this Phase 1 setup. Do not use the development password or plaintext Kafka listener in production.
 
-Phase 3 provides registration, login, refresh, logout, and protected authorization policy checks. Catalog, cache adapters, and Kafka handlers are implemented in later phases.
+Phase 3 provides registration, login, refresh, logout, and protected authorization policy checks. Cache adapters and Kafka handlers are implemented in later phases.
 
 ## Phase 3 authentication and Swagger
 
@@ -60,8 +60,10 @@ Open `https://localhost:53374/swagger` or `http://localhost:53375/swagger` (the 
 
 1. Call `POST /api/v1/auth/register` with a unique email, strong password, first name, and last name.
 2. Call `POST /api/v1/auth/login` with that email and password. Copy `accessToken` and `refreshToken` from the response.
-3. Click **Authorize** and enter the access token. The Bearer scheme is configured in OpenAPI. Phase 3 has no protected business operation; Customer, Support, InventoryManager, Admin, and ownership policies are exercised by the integration suite until Phase 4 adds protected feature routes.
+3. Click **Authorize** and enter the access token. The Bearer scheme is configured in OpenAPI. Staff roles can access the catalog and inventory routes documented in `docs/API_CONTRACTS.md`.
 4. Call `POST /api/v1/auth/refresh` with the current `refreshToken`; replace both copied tokens with the returned pair.
 5. Call `POST /api/v1/auth/logout` with the refresh token to revoke it. Reusing a rotated refresh token revokes the active token family.
 
 Registration assigns only the Customer role. Support, InventoryManager, and Admin are seeded roles for controlled staff provisioning; public registration cannot choose a role. API requests return `X-Correlation-Id`, including failures.
+
+Phase 5 reservations expire after 15 minutes by default. Set `Inventory__ReservationMinutes` to a value from 1 to 1440 to change the timeout. The expiry job interface is available for the Worker; automatic scheduling is added in Phase 9. Inventory mutations use SQL Server and do not require Redis or Kafka.

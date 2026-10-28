@@ -139,6 +139,14 @@ Inventory Manager policy.
 
 Returns the new `onHand`, `reserved`, `available`, and version. A negative result returns `409 INVENTORY_BELOW_ZERO`.
 
+### GET `/inventory/{productId}` and GET `/inventory/{productId}/reservations`
+
+Inventory Manager only. The first endpoint returns `productId`, `onHand`, `reserved`, `available`, `lowStockThreshold`, and Base64 `version`. The second returns up to 100 recent reservations for that product with `id`, `orderId`, `productId`, `quantity`, `status`, and `expiresAtUtc`.
+
+### PUT `/inventory/{productId}/threshold`
+
+Inventory Manager only. Accepts `{ "lowStockThreshold": 5 }` with a non-negative integer and returns the updated inventory snapshot. The `InventoryLow` event is emitted when a later stock mutation crosses the configured threshold.
+
 ## Cart
 
 ### GET `/cart`
