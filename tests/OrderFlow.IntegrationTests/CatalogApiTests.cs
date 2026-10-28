@@ -72,6 +72,28 @@ public sealed class CatalogApiTests
             Assert.Single((await publicClient.GetFromJsonAsync<PageDto>("/api/v1/products?pageSize=1&search=Widget", TestContext.Current.CancellationToken))!.Items);
             Assert.Empty((await publicClient.GetFromJsonAsync<PageDto>("/api/v1/products?isAvailable=true", TestContext.Current.CancellationToken))!.Items);
 
+            var inventoryUrl = $"/api/v1/inventory/{created.Id}";
+            Assert.Equal(HttpStatusCode.Unauthorized, (await publicClient.GetAsync(inventoryUrl, TestContext.Current.CancellationToken)).StatusCode);
+            Assert.Equal(HttpStatusCode.Forbidden, (await adminClient.PostAsJsonAsync($"{inventoryUrl}/adjust", new { quantityDelta = 2, reasonCode = "RECEIPT" }, TestContext.Current.CancellationToken)).StatusCode);
+            await using (var scope = factory.Services.CreateAsyncScope())
+            {
+                var manager = scope.ServiceProvider.GetRequiredService<UserManager<ApplicationUser>>();
+                var user = await manager.FindByEmailAsync("catalog-admin@example.com");
+                Assert.True((await manager.AddToRoleAsync(user!, "InventoryManager")).Succeeded);
+            }
+            var inventoryLogin = await adminClient.PostAsJsonAsync("/api/v1/auth/login", new { email = "catalog-admin@example.com", password = "StrongPassword123!" }, TestContext.Current.CancellationToken);
+            using (var body = JsonDocument.Parse(await inventoryLogin.Content.ReadAsStringAsync(TestContext.Current.CancellationToken)))
+                adminClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", body.RootElement.GetProperty("accessToken").GetString());
+            Assert.Equal(HttpStatusCode.BadRequest, (await adminClient.PostAsJsonAsync($"{inventoryUrl}/adjust", new { quantityDelta = 0, reasonCode = "RECEIPT" }, TestContext.Current.CancellationToken)).StatusCode);
+            Assert.Equal(HttpStatusCode.OK, (await adminClient.PostAsJsonAsync($"{inventoryUrl}/adjust", new { quantityDelta = 2, reasonCode = "RECEIPT" }, TestContext.Current.CancellationToken)).StatusCode);
+            var overdraw = await adminClient.PostAsJsonAsync($"{inventoryUrl}/adjust", new { quantityDelta = -3, reasonCode = "CORRECTION" }, TestContext.Current.CancellationToken);
+            Assert.Equal(HttpStatusCode.Conflict, overdraw.StatusCode);
+            Assert.Contains("INVENTORY_BELOW_ZERO", await overdraw.Content.ReadAsStringAsync(TestContext.Current.CancellationToken));
+            Assert.Equal(HttpStatusCode.OK, (await adminClient.GetAsync(inventoryUrl, TestContext.Current.CancellationToken)).StatusCode);
+            Assert.Equal(HttpStatusCode.OK, (await adminClient.GetAsync($"{inventoryUrl}/reservations", TestContext.Current.CancellationToken)).StatusCode);
+            Assert.Equal(HttpStatusCode.OK, (await adminClient.PutAsJsonAsync($"{inventoryUrl}/threshold", new { lowStockThreshold = 1 }, TestContext.Current.CancellationToken)).StatusCode);
+            Assert.Equal(HttpStatusCode.OK, (await adminClient.PostAsJsonAsync($"{inventoryUrl}/adjust", new { quantityDelta = -2, reasonCode = "CORRECTION" }, TestContext.Current.CancellationToken)).StatusCode);
+
             var update = await adminClient.PutAsJsonAsync($"/api/v1/products/{created.Id}", Product(categoryId, "P-001", "Updated", created.Version), TestContext.Current.CancellationToken);
             Assert.Equal(HttpStatusCode.OK, update.StatusCode);
             var stale = await adminClient.PutAsJsonAsync($"/api/v1/products/{created.Id}", Product(categoryId, "P-001", "Stale", created.Version), TestContext.Current.CancellationToken);

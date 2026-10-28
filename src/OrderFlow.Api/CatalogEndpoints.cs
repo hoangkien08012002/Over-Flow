@@ -2,6 +2,7 @@ using System.Data;
 using Microsoft.Data.SqlClient;
 using Microsoft.EntityFrameworkCore;
 using OrderFlow.Domain.Catalog;
+using OrderFlow.Domain.Inventory;
 using OrderFlow.Infrastructure.Persistence;
 
 namespace OrderFlow.Api;
@@ -135,6 +136,7 @@ public static class CatalogEndpoints
             return Error(context, 400, "VALIDATION_FAILED", "Active category is required");
         var product = Product.Create(Guid.NewGuid(), request.CategoryId, request.Sku!, request.Name!, request.Description, request.Price, request.CurrencyCode!, DateTimeOffset.UtcNow, request.IsActive);
         db.Products.Add(product);
+        db.Inventories.Add(Inventory.Create(Guid.NewGuid(), product.Id, 0, DateTimeOffset.UtcNow));
         try { await db.SaveChangesAsync(cancellationToken); }
         catch (DbUpdateException exception) when (IsUniqueViolation(exception)) { return Error(context, 409, "SKU_ALREADY_EXISTS", "Product SKU already exists"); }
         await transaction.CommitAsync(cancellationToken);

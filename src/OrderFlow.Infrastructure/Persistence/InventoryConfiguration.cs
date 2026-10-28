@@ -40,3 +40,38 @@ internal sealed class InventoryAdjustmentConfiguration : IEntityTypeConfiguratio
         entity.HasOne<ApplicationUser>().WithMany().HasForeignKey(x => x.ActorUserId).OnDelete(DeleteBehavior.Restrict);
     }
 }
+
+internal sealed class InventoryReservationConfiguration : IEntityTypeConfiguration<InventoryReservation>
+{
+    public void Configure(EntityTypeBuilder<InventoryReservation> entity)
+    {
+        entity.ToTable("InventoryReservations", table =>
+        {
+            table.HasCheckConstraint("CK_InventoryReservations_Quantity", "[Quantity] > 0");
+            table.HasCheckConstraint("CK_InventoryReservations_Status", "[Status] IN ('Active','Committed','Released','Expired')");
+            table.HasCheckConstraint("CK_InventoryReservations_Expiry", "[ExpiresAtUtc] > [CreatedAtUtc]");
+        });
+        entity.HasKey(x => x.Id);
+        entity.Property(x => x.Id).ValueGeneratedNever();
+        entity.Property(x => x.Status).HasConversion<string>().HasMaxLength(20).IsRequired();
+        entity.Property(x => x.RowVersion).IsRowVersion();
+        entity.HasIndex(x => new { x.OrderId, x.ProductId }).IsUnique();
+        entity.HasIndex(x => new { x.Status, x.ExpiresAtUtc });
+        entity.HasOne<Product>().WithMany().HasForeignKey(x => x.ProductId).OnDelete(DeleteBehavior.Restrict);
+    }
+}
+
+internal sealed class OutboxMessageConfiguration : IEntityTypeConfiguration<OutboxMessage>
+{
+    public void Configure(EntityTypeBuilder<OutboxMessage> entity)
+    {
+        entity.ToTable("OutboxMessages");
+        entity.HasKey(x => x.Id);
+        entity.Property(x => x.Id).ValueGeneratedNever();
+        entity.Property(x => x.EventType).HasMaxLength(100).IsRequired();
+        entity.Property(x => x.CorrelationId).HasMaxLength(100).IsRequired();
+        entity.Property(x => x.Payload).IsRequired();
+        entity.Property(x => x.LastError).HasMaxLength(1000);
+        entity.HasIndex(x => new { x.ProcessedAtUtc, x.NextAttemptAtUtc, x.OccurredAtUtc });
+    }
+}

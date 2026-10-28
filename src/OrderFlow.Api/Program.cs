@@ -9,6 +9,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi;
 using OrderFlow.Api;
+using OrderFlow.Application.Inventory;
 using OrderFlow.Infrastructure.Identity;
 using OrderFlow.Infrastructure.Persistence;
 
@@ -41,6 +42,12 @@ builder.Services.AddIdentityCore<ApplicationUser>(options =>
     .AddSignInManager();
 builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddScoped<AuthenticationService>();
+builder.Services.AddOptions<InventoryOptions>().Bind(builder.Configuration.GetSection("Inventory"))
+    .Validate(x => x.ReservationMinutes is >= 1 and <= 1440, "Inventory reservation lifetime must be 1 to 1440 minutes.")
+    .ValidateOnStart();
+builder.Services.AddScoped<InventoryService>();
+builder.Services.AddScoped<IInventoryService>(sp => sp.GetRequiredService<InventoryService>());
+builder.Services.AddScoped<IReservationExpiryJob>(sp => sp.GetRequiredService<InventoryService>());
 builder.Services.AddScoped<IAuthorizationHandler, OwnResourceHandler>();
 builder.Services.AddHostedService<RoleSeeder>();
 builder.Services.AddProblemDetails(options => options.CustomizeProblemDetails = context =>
@@ -137,6 +144,7 @@ app.MapPost("/api/v1/auth/logout", async (RefreshRequest request, Authentication
 }).AllowAnonymous().RequireRateLimiting("logout");
 
 app.MapCatalogEndpoints();
+app.MapInventoryEndpoints();
 
 app.Run();
 
