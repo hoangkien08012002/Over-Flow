@@ -114,6 +114,34 @@ public sealed class InventoryService(OrderFlowDbContext db, TimeProvider clock, 
         return Snapshot(reservation);
     }
 
+    public async Task<int> ReleaseForCancellationAsync(Guid orderId, CancellationToken cancellationToken)
+    {
+        if (orderId == Guid.Empty || db.Database.CurrentTransaction is null)
+            throw new InvalidOperationException("Cancellation release requires an active SQL transaction.");
+        var productIds = await db.InventoryReservations.AsNoTracking().Where(x => x.OrderId == orderId)
+            .OrderBy(x => x.ProductId).Select(x => x.ProductId).ToListAsync(cancellationToken);
+        var released = 0;
+        foreach (var productId in productIds)
+        {
+            // Match the inventory-first lock order used by reservation and terminal transitions.
+            var inventory = await LockedInventoryAsync(productId, cancellationToken)
+                ?? throw new DbUpdateConcurrencyException("Inventory disappeared during cancellation.");
+            var reservation = await db.InventoryReservations.SingleAsync(x => x.OrderId == orderId && x.ProductId == productId, cancellationToken);
+            if (reservation.Status == ReservationStatus.Released) continue;
+            if (reservation.Status == ReservationStatus.Expired) continue;
+            if (reservation.Status != ReservationStatus.Active)
+                throw new InvalidOperationException("Reservation cannot be released after commitment.");
+            var now = clock.GetUtcNow();
+            reservation.TransitionTo(ReservationStatus.Released, now);
+            var changed = await db.Inventories.Where(x => x.Id == inventory.Id && x.Reserved >= reservation.Quantity)
+                .ExecuteUpdateAsync(setters => setters.SetProperty(x => x.Reserved, x => x.Reserved - reservation.Quantity)
+                    .SetProperty(x => x.UpdatedAtUtc, now), cancellationToken);
+            if (changed != 1) throw new DbUpdateConcurrencyException("Inventory changed during cancellation release.");
+            released++;
+        }
+        return released;
+    }
+
     public async Task<int> ExpireDueAsync(int batchSize, CancellationToken cancellationToken)
     {
         if (batchSize is < 1 or > 1000) throw new ArgumentOutOfRangeException(nameof(batchSize));

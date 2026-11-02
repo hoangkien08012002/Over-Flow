@@ -1,0 +1,8 @@
+{
+  "ConnectionStrings": {
+    "OrderFlow": "Server=127.0.0.1,1433;Database=OrderFlow;User ID=sa;Password=REPLACE_WITH_LOCAL_PASSWORD;TrustServerCertificate=True;Encrypt=False"
+  },
+  "Jwt": {
+    "SigningKey": "REPLACE_WITH_RANDOM_KEY_AT_LEAST_32_BYTES"
+  }
+}
