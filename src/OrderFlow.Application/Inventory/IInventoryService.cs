@@ -16,6 +16,8 @@ public interface IInventoryService
     Task<InventorySnapshot?> SetLowStockThresholdAsync(Guid productId, int threshold, CancellationToken cancellationToken);
     Task<ReserveResult> ReserveAsync(Guid orderId, Guid productId, int quantity, CancellationToken cancellationToken);
     Task<ReservationSnapshot?> TransitionAsync(Guid orderId, Guid productId, ReservationStatus target, CancellationToken cancellationToken);
+    // Must be called within the ordering transaction so release and cancellation commit together.
+    Task<int> ReleaseForCancellationAsync(Guid orderId, CancellationToken cancellationToken);
 }
 
 public interface IReservationExpiryJob

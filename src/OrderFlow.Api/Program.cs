@@ -48,6 +48,10 @@ builder.Services.AddOptions<InventoryOptions>().Bind(builder.Configuration.GetSe
 builder.Services.AddScoped<InventoryService>();
 builder.Services.AddScoped<IInventoryService>(sp => sp.GetRequiredService<InventoryService>());
 builder.Services.AddScoped<IReservationExpiryJob>(sp => sp.GetRequiredService<InventoryService>());
+builder.Services.AddScoped<CheckoutService>();
+builder.Services.AddOptions<OrderingOptions>().Bind(builder.Configuration.GetSection("Ordering"))
+    .Validate(x => x.IdempotencyRetentionHours is >= 1 and <= 720, "Idempotency retention must be 1 to 720 hours.")
+    .ValidateOnStart();
 builder.Services.AddScoped<IAuthorizationHandler, OwnResourceHandler>();
 builder.Services.AddHostedService<RoleSeeder>();
 builder.Services.AddProblemDetails(options => options.CustomizeProblemDetails = context =>
@@ -103,6 +107,7 @@ builder.Services.AddSwaggerGen(options =>
 {
     options.SwaggerDoc("v1", new OpenApiInfo { Title = "OrderFlow API", Version = "v1" });
     options.AddSecurityDefinition("Bearer", new OpenApiSecurityScheme { Name = "Authorization", Type = SecuritySchemeType.Http, Scheme = "bearer", BearerFormat = "JWT", In = ParameterLocation.Header });
+    options.OperationFilter<AuthorizationOperationFilter>();
 });
 
 var app = builder.Build();
@@ -145,6 +150,7 @@ app.MapPost("/api/v1/auth/logout", async (RefreshRequest request, Authentication
 
 app.MapCatalogEndpoints();
 app.MapInventoryEndpoints();
+app.MapOrderingEndpoints();
 
 app.Run();
 

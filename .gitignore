@@ -38,6 +38,7 @@ ScaffoldingReadMe.txt
 
 # dotenv environment variables file
 .env
+src/OrderFlow.Api/appsettings.Development.json
 
 # Others
 ~$*
