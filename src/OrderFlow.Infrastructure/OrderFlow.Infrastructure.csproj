@@ -6,6 +6,7 @@
     <PackageReference Include="System.Security.Cryptography.Pkcs" />
     <PackageReference Include="Microsoft.AspNetCore.Identity.EntityFrameworkCore" />
     <PackageReference Include="StackExchange.Redis" />
+    <PackageReference Include="Confluent.Kafka" />
     <ProjectReference Include="../OrderFlow.Application/OrderFlow.Application.csproj" />
     <ProjectReference Include="../OrderFlow.Domain/OrderFlow.Domain.csproj" />
   </ItemGroup>

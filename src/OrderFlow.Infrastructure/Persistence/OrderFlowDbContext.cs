@@ -3,7 +3,9 @@ using Microsoft.AspNetCore.Identity.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore;
 using OrderFlow.Domain.Catalog;
 using OrderFlow.Domain.Inventory;
+using OrderFlow.Domain.Notifications;
 using OrderFlow.Domain.Ordering;
+using OrderFlow.Domain.Payments;
 using OrderFlow.Infrastructure.Identity;
 
 namespace OrderFlow.Infrastructure.Persistence;
@@ -27,6 +29,11 @@ public sealed class OrderFlowDbContext(DbContextOptions<OrderFlowDbContext> opti
     public DbSet<OrderItem> OrderItems => Set<OrderItem>();
     public DbSet<OrderStatusHistory> OrderStatusHistories => Set<OrderStatusHistory>();
     public DbSet<IdempotencyRecord> IdempotencyRecords => Set<IdempotencyRecord>();
+    public DbSet<InboxMessage> InboxMessages => Set<InboxMessage>();
+    public DbSet<FailedMessage> FailedMessages => Set<FailedMessage>();
+    public DbSet<Payment> Payments => Set<Payment>();
+    public DbSet<Refund> Refunds => Set<Refund>();
+    public DbSet<Notification> Notifications => Set<Notification>();
 
     protected override void OnModelCreating(ModelBuilder builder)
     {

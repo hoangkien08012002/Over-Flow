@@ -7,6 +7,7 @@ using Microsoft.Data.SqlClient;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 using OrderFlow.Application.Inventory;
+using OrderFlow.Application.Messaging;
 using OrderFlow.Domain.Ordering;
 
 namespace OrderFlow.Infrastructure.Persistence;
@@ -77,7 +78,7 @@ public sealed class CheckoutService(OrderFlowDbContext db, TimeProvider clock, I
                     .SingleOrDefaultAsync(ct);
                 if (coupon is null || !coupon.IsEnabled || now < coupon.ValidFromUtc || now >= coupon.ValidUntilUtc || subtotal < coupon.MinimumSubtotal ||
                     coupon.TotalUsageLimit is int limit && coupon.UsageCount >= limit ||
-                    coupon.PerUserUsageLimit is int userLimit && await db.CouponUsages.CountAsync(x => x.CouponId == coupon.Id && x.UserId == userId, ct) >= userLimit)
+                    coupon.PerUserUsageLimit is int userLimit && await db.CouponUsages.CountAsync(x => x.CouponId == coupon.Id && x.UserId == userId && x.ReleasedAtUtc == null, ct) >= userLimit)
                     return new(400, "VALIDATION_FAILED", null);
                 discount = coupon.CalculateDiscount(subtotal);
                 coupon.Use();
@@ -102,13 +103,9 @@ public sealed class CheckoutService(OrderFlowDbContext db, TimeProvider clock, I
             record.Complete(orderId, body);
             db.CartItems.RemoveRange(cart.Items);
             cart.Touch(now);
-            var eventId = Guid.NewGuid();
-            db.OutboxMessages.Add(new OutboxMessage { Id = eventId, EventType = "OrderCreated", EventVersion = 1, AggregateId = orderId,
-                CorrelationId = correlationId, OccurredAtUtc = now,
-                Payload = JsonSerializer.Serialize(new { eventId, eventType = "OrderCreated", eventVersion = 1, occurredAtUtc = now,
-                    correlationId, causationId = (Guid?)null, aggregateId = orderId, producer = "OrderFlow.Api",
-                    payload = new { orderId, userId, orderNumber = number, currencyCode = order.CurrencyCode, grandTotal = order.GrandTotal,
-                        paymentMethod = order.PaymentMethod, items = order.Items.Select(x => new { productId = x.ProductId, quantity = x.Quantity, unitPrice = x.UnitPrice }) } }, JsonOptions) });
+            db.OutboxMessages.Add(OutboxMessage.ForEvent(EventTypes.OrderCreated, orderId, correlationId, null,
+                new OrderCreatedPayload(orderId, userId, number, order.CurrencyCode, order.GrandTotal, order.PaymentMethod,
+                    order.Items.Select(x => new OrderCreatedItem(x.ProductId, x.Quantity, x.UnitPrice)).ToList()), now));
             await db.SaveChangesAsync(ct);
             await transaction.CommitAsync(ct);
             return new(202, null, body);
@@ -137,15 +134,23 @@ public sealed class CheckoutService(OrderFlowDbContext db, TimeProvider clock, I
         try { await inventoryService.ReleaseForCancellationAsync(orderId, ct); }
         catch (InvalidOperationException) { return new(409, "INVALID_STATE_TRANSITION", null); }
         catch (DbUpdateConcurrencyException) { return new(409, "CONCURRENCY_CONFLICT", null); }
-        var eventId = Guid.NewGuid();
-        db.OutboxMessages.Add(new OutboxMessage { Id = eventId, EventType = "OrderCancelled", EventVersion = 1,
-            AggregateId = order.Id, CorrelationId = correlationId, OccurredAtUtc = clock.GetUtcNow(),
-            Payload = JsonSerializer.Serialize(new { eventId, eventType = "OrderCancelled", eventVersion = 1,
-                occurredAtUtc = clock.GetUtcNow(), correlationId, causationId = (Guid?)null, aggregateId = order.Id,
-                producer = "OrderFlow.Api", payload = new { orderId = order.Id, userId, reasonCode = "CUSTOMER_REQUEST" } }, JsonOptions) });
+        await ReleaseCouponAsync(db, order, clock.GetUtcNow(), ct);
+        db.OutboxMessages.Add(OutboxMessage.ForEvent(EventTypes.OrderCancelled, order.Id, correlationId, null,
+            new OrderCancelledPayload(order.Id, userId, "CUSTOMER_REQUEST"), clock.GetUtcNow()));
         try { await db.SaveChangesAsync(ct); await transaction.CommitAsync(ct); }
         catch (DbUpdateConcurrencyException) { return new(409, "CONCURRENCY_CONFLICT", null); }
         return new(200, null, JsonSerializer.Serialize(ToResponse(order), JsonOptions));
+    }
+
+    // Called in the transaction that moves an order to a failed terminal status. Coupon before usage matches checkout's lock order.
+    public static async Task ReleaseCouponAsync(OrderFlowDbContext db, Order order, DateTimeOffset now, CancellationToken ct)
+    {
+        if (order.CouponId is not Guid couponId) return;
+        var coupon = await db.Coupons.FromSqlInterpolated($"SELECT * FROM dbo.Coupons WITH (UPDLOCK, ROWLOCK) WHERE Id = {couponId}").SingleAsync(ct);
+        var usage = await db.CouponUsages.SingleOrDefaultAsync(x => x.OrderId == order.Id && x.CouponId == couponId && x.ReleasedAtUtc == null, ct);
+        if (usage is null) return;
+        usage.Release(now);
+        coupon.ReturnUse(now);
     }
 
     public static OrderResponse ToResponse(Order order) => new(order.Id, order.OrderNumber, order.Status.ToString(), order.Subtotal,
