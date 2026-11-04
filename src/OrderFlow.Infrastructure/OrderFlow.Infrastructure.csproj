@@ -5,6 +5,7 @@
     <!-- SqlClient currently pulls in a vulnerable 9.x version; use the patched .NET 10 package. -->
     <PackageReference Include="System.Security.Cryptography.Pkcs" />
     <PackageReference Include="Microsoft.AspNetCore.Identity.EntityFrameworkCore" />
+    <PackageReference Include="StackExchange.Redis" />
     <ProjectReference Include="../OrderFlow.Application/OrderFlow.Application.csproj" />
     <ProjectReference Include="../OrderFlow.Domain/OrderFlow.Domain.csproj" />
   </ItemGroup>

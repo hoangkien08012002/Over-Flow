@@ -5,11 +5,14 @@ using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.RateLimiting;
+using Microsoft.Data.SqlClient;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi;
 using OrderFlow.Api;
+using OrderFlow.Application.Catalog;
 using OrderFlow.Application.Inventory;
+using OrderFlow.Infrastructure.Caching;
 using OrderFlow.Infrastructure.Identity;
 using OrderFlow.Infrastructure.Persistence;
 
@@ -52,6 +55,13 @@ builder.Services.AddScoped<CheckoutService>();
 builder.Services.AddOptions<OrderingOptions>().Bind(builder.Configuration.GetSection("Ordering"))
     .Validate(x => x.IdempotencyRetentionHours is >= 1 and <= 720, "Idempotency retention must be 1 to 720 hours.")
     .ValidateOnStart();
+builder.Services.AddOptions<RedisOptions>().Bind(builder.Configuration.GetSection("Redis"))
+    // Scoping keys to the authoritative database keeps environments that share one Redis from reading each other's entries.
+    .PostConfigure(x => x.KeyPrefix ??= $"{new SqlConnectionStringBuilder(GetConnectionString()).InitialCatalog}:")
+    .Validate(x => !string.IsNullOrWhiteSpace(x.ConnectionString), "Redis:ConnectionString is required.")
+    .Validate(x => x.TimeoutMilliseconds is >= 10 and <= 5000, "Redis timeout must be 10 to 5000 milliseconds.")
+    .ValidateOnStart();
+builder.Services.AddSingleton<IReadCache, RedisReadCache>();
 builder.Services.AddScoped<IAuthorizationHandler, OwnResourceHandler>();
 builder.Services.AddHostedService<RoleSeeder>();
 builder.Services.AddProblemDetails(options => options.CustomizeProblemDetails = context =>
