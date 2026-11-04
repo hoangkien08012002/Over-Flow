@@ -1,6 +1,7 @@
 using System.Data;
 using Microsoft.Data.SqlClient;
 using Microsoft.EntityFrameworkCore;
+using OrderFlow.Application.Catalog;
 using OrderFlow.Domain.Catalog;
 using OrderFlow.Domain.Inventory;
 using OrderFlow.Infrastructure.Persistence;
@@ -25,17 +26,22 @@ public static class CatalogEndpoints
         products.MapPut("/{id:guid}/activation", SetProductActivation).RequireAuthorization("Admin");
     }
 
-    private static async Task<IResult> ListCategories(OrderFlowDbContext db, HttpContext context, CancellationToken cancellationToken)
+    private static async Task<IResult> ListCategories(OrderFlowDbContext db, IReadCache cache, HttpContext context, CancellationToken cancellationToken)
     {
-        var includeInactive = IsAdmin(context) && context.Request.Query["includeInactive"] == "true";
-        var rows = await db.Categories.AsNoTracking()
-            .Where(x => includeInactive || x.IsActive)
-            .OrderBy(x => x.Name).ThenBy(x => x.Id)
-            .ToListAsync(cancellationToken);
-        return Results.Ok(rows.Select(ToCategoryResponse));
+        if (IsAdmin(context) && context.Request.Query["includeInactive"] == "true")
+        {
+            var rows = await db.Categories.AsNoTracking().OrderBy(x => x.Name).ThenBy(x => x.Id).ToListAsync(cancellationToken);
+            return Results.Ok(rows.Select(ToCategoryResponse));
+        }
+        var active = await cache.GetOrLoadAsync(CatalogCache.Categories, CatalogCache.CategoriesKey, async token =>
+        {
+            var rows = await db.Categories.AsNoTracking().Where(x => x.IsActive).OrderBy(x => x.Name).ThenBy(x => x.Id).ToListAsync(token);
+            return rows.Select(x => new CachedCategory(x.Id, x.Name, x.Slug, x.Description, x.IsActive, Convert.ToBase64String(x.RowVersion))).ToArray();
+        }, cancellationToken);
+        return Results.Ok(active!.Select(x => new CategoryResponse(x.Id, x.Name, x.Slug, x.Description, x.IsActive, x.Version)));
     }
 
-    private static async Task<IResult> CreateCategory(CategoryRequest request, OrderFlowDbContext db, HttpContext context, CancellationToken cancellationToken)
+    private static async Task<IResult> CreateCategory(CategoryRequest request, OrderFlowDbContext db, IReadCache cache, HttpContext context, CancellationToken cancellationToken)
     {
         if (!ValidCategory(request)) return Error(context, 400, "VALIDATION_FAILED", "Invalid category");
         var category = Category.Create(Guid.NewGuid(), request.Name!, request.Slug!, request.Description, DateTimeOffset.UtcNow);
@@ -43,10 +49,11 @@ public static class CatalogEndpoints
         db.Categories.Add(category);
         try { await db.SaveChangesAsync(cancellationToken); }
         catch (DbUpdateException exception) when (IsUniqueViolation(exception)) { return Error(context, 409, "SLUG_ALREADY_EXISTS", "Category slug already exists"); }
+        await cache.InvalidateAsync([CatalogCache.CategoriesKey]);
         return Results.Created($"/api/v1/categories/{category.Id}", ToCategoryResponse(category));
     }
 
-    private static async Task<IResult> UpdateCategory(Guid id, CategoryRequest request, OrderFlowDbContext db, HttpContext context, CancellationToken cancellationToken)
+    private static async Task<IResult> UpdateCategory(Guid id, CategoryRequest request, OrderFlowDbContext db, IReadCache cache, HttpContext context, CancellationToken cancellationToken)
     {
         if (!ValidCategory(request) || !TryVersion(request.Version, out var version)) return Error(context, 400, "VALIDATION_FAILED", "Invalid category or version");
         var category = await db.Categories.FindAsync([id], cancellationToken);
@@ -57,10 +64,11 @@ public static class CatalogEndpoints
         try { await db.SaveChangesAsync(cancellationToken); }
         catch (DbUpdateConcurrencyException) { return Error(context, 409, "CONCURRENCY_CONFLICT", "Category was changed"); }
         catch (DbUpdateException exception) when (IsUniqueViolation(exception)) { return Error(context, 409, "SLUG_ALREADY_EXISTS", "Category slug already exists"); }
+        await InvalidateCategoryAsync(db, cache, id);
         return Results.Ok(ToCategoryResponse(category));
     }
 
-    private static async Task<IResult> SetCategoryActivation(Guid id, ActivationRequest request, OrderFlowDbContext db, HttpContext context, CancellationToken cancellationToken)
+    private static async Task<IResult> SetCategoryActivation(Guid id, ActivationRequest request, OrderFlowDbContext db, IReadCache cache, HttpContext context, CancellationToken cancellationToken)
     {
         if (!TryVersion(request.Version, out var version)) return Error(context, 400, "VALIDATION_FAILED", "Invalid version");
         var category = await db.Categories.FindAsync([id], cancellationToken);
@@ -69,6 +77,7 @@ public static class CatalogEndpoints
         category.SetActive(request.IsActive, DateTimeOffset.UtcNow);
         try { await db.SaveChangesAsync(cancellationToken); }
         catch (DbUpdateConcurrencyException) { return Error(context, 409, "CONCURRENCY_CONFLICT", "Category was changed"); }
+        await InvalidateCategoryAsync(db, cache, id);
         return Results.Ok(ToCategoryResponse(category));
     }
 
@@ -115,17 +124,33 @@ public static class CatalogEndpoints
         return Results.Ok(new { items = rows.Select(x => ToProductResponse(x.product, x.Name, x.Available)), page, pageSize, totalCount, totalPages = (int)Math.Ceiling((double)totalCount / pageSize) });
     }
 
-    private static async Task<IResult> GetProduct(Guid id, OrderFlowDbContext db, HttpContext context, CancellationToken cancellationToken)
+    private static async Task<IResult> GetProduct(Guid id, OrderFlowDbContext db, IReadCache cache, HttpContext context, CancellationToken cancellationToken)
     {
         var canViewInactive = IsAdmin(context) || context.User.IsInRole("Support");
+        // One entry serves every caller, so visibility is checked after the read.
+        var product = await cache.GetOrLoadAsync(CatalogCache.Product, CatalogCache.ProductKey(id), token => LoadProductAsync(db, id, token), cancellationToken);
+        if (product is null || (!canViewInactive && !(product.IsActive && product.CategoryIsActive)))
+            return Error(context, 404, "RESOURCE_NOT_FOUND", "Product not found");
+        var available = await db.Inventories.AsNoTracking().Where(x => x.ProductId == id).Select(x => x.OnHand - x.Reserved).SingleOrDefaultAsync(cancellationToken);
+        return Results.Ok(new ProductResponse(product.Id, product.CategoryId, product.CategoryName, product.Sku, product.Name, product.Description, product.Price, product.CurrencyCode, product.IsActive, available, product.Version));
+    }
+
+    private static async Task<CachedProduct?> LoadProductAsync(OrderFlowDbContext db, Guid id, CancellationToken cancellationToken)
+    {
         var row = await (from product in db.Products.AsNoTracking()
                          join category in db.Categories.AsNoTracking() on product.CategoryId equals category.Id
-                         join inventory in db.Inventories.AsNoTracking() on product.Id equals inventory.ProductId into stocks
-                         from inventory in stocks.DefaultIfEmpty()
-                         where product.Id == id && (canViewInactive || (product.IsActive && category.IsActive))
-                         select new { product, CategoryName = category.Name, Available = inventory == null ? 0 : inventory.OnHand - inventory.Reserved })
+                         where product.Id == id
+                         select new { product, CategoryName = category.Name, CategoryIsActive = category.IsActive })
             .SingleOrDefaultAsync(cancellationToken);
-        return row is null ? Error(context, 404, "RESOURCE_NOT_FOUND", "Product not found") : Results.Ok(ToProductResponse(row.product, row.CategoryName, row.Available));
+        return row is null ? null : new CachedProduct(row.product.Id, row.product.CategoryId, row.CategoryName, row.CategoryIsActive, row.product.Sku, row.product.Name,
+            row.product.Description, row.product.Price, row.product.CurrencyCode, row.product.IsActive, Convert.ToBase64String(row.product.RowVersion));
+    }
+
+    // Cached products embed the category name and active flag, so a category change reaches each of its products.
+    private static async Task InvalidateCategoryAsync(OrderFlowDbContext db, IReadCache cache, Guid categoryId)
+    {
+        var productIds = await db.Products.AsNoTracking().Where(x => x.CategoryId == categoryId).Select(x => x.Id).ToListAsync(CancellationToken.None);
+        await cache.InvalidateAsync([CatalogCache.CategoriesKey, .. productIds.Select(CatalogCache.ProductKey)]);
     }
 
     private static async Task<IResult> CreateProduct(ProductRequest request, OrderFlowDbContext db, HttpContext context, CancellationToken cancellationToken)
@@ -143,7 +168,7 @@ public static class CatalogEndpoints
         return Results.Created($"/api/v1/products/{product.Id}", await ProductResponseAsync(db, product, cancellationToken));
     }
 
-    private static async Task<IResult> UpdateProduct(Guid id, ProductRequest request, OrderFlowDbContext db, HttpContext context, CancellationToken cancellationToken)
+    private static async Task<IResult> UpdateProduct(Guid id, ProductRequest request, OrderFlowDbContext db, IReadCache cache, HttpContext context, CancellationToken cancellationToken)
     {
         if (!ValidProduct(request) || !TryVersion(request.Version, out var version)) return Error(context, 400, "VALIDATION_FAILED", "Invalid product or version");
         await using var transaction = await db.Database.BeginTransactionAsync(IsolationLevel.Serializable, cancellationToken);
@@ -158,10 +183,11 @@ public static class CatalogEndpoints
         catch (DbUpdateConcurrencyException) { return Error(context, 409, "CONCURRENCY_CONFLICT", "Product was changed"); }
         catch (DbUpdateException exception) when (IsUniqueViolation(exception)) { return Error(context, 409, "SKU_ALREADY_EXISTS", "Product SKU already exists"); }
         await transaction.CommitAsync(cancellationToken);
+        await cache.InvalidateAsync([CatalogCache.ProductKey(id)]);
         return Results.Ok(await ProductResponseAsync(db, product, cancellationToken));
     }
 
-    private static async Task<IResult> SetProductActivation(Guid id, ActivationRequest request, OrderFlowDbContext db, HttpContext context, CancellationToken cancellationToken)
+    private static async Task<IResult> SetProductActivation(Guid id, ActivationRequest request, OrderFlowDbContext db, IReadCache cache, HttpContext context, CancellationToken cancellationToken)
     {
         if (!TryVersion(request.Version, out var version)) return Error(context, 400, "VALIDATION_FAILED", "Invalid version");
         var product = await db.Products.FindAsync([id], cancellationToken);
@@ -174,6 +200,7 @@ public static class CatalogEndpoints
         try { await db.SaveChangesAsync(cancellationToken); }
         catch (DbUpdateConcurrencyException) { return Error(context, 409, "CONCURRENCY_CONFLICT", "Product was changed"); }
         await transaction.CommitAsync(cancellationToken);
+        await cache.InvalidateAsync([CatalogCache.ProductKey(id)]);
         return Results.Ok(await ProductResponseAsync(db, product, cancellationToken));
     }
 
