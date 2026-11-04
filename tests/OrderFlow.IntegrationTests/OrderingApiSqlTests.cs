@@ -117,6 +117,11 @@ public sealed class OrderingApiSqlTests
             Assert.Equal(seed.Stocked.Name, item.GetProperty("productNameSnapshot").GetString());
             Assert.Equal(seed.Stocked.Sku, item.GetProperty("skuSnapshot").GetString());
             Assert.Equal(10m, item.GetProperty("unitPrice").GetDecimal());
+            // D-25: order detail exposes a DTO with readable statuses, not domain entities.
+            Assert.False(item.TryGetProperty("orderId", out _));
+            var history = detail.RootElement.GetProperty("history").EnumerateArray().Single();
+            Assert.Equal("PendingInventory", history.GetProperty("toStatus").GetString());
+            Assert.Equal(JsonValueKind.Null, history.GetProperty("fromStatus").ValueKind);
         }
 
         using (var list = await ReadJsonAsync(await customer.GetAsync("/api/v1/orders?status=PendingInventory&page=1&pageSize=5", ct), ct))

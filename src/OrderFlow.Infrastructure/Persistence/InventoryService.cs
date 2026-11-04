@@ -1,8 +1,8 @@
 using System.Data;
-using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 using OrderFlow.Application.Inventory;
+using OrderFlow.Application.Messaging;
 using OrderFlow.Domain.Inventory;
 
 namespace OrderFlow.Infrastructure.Persistence;
@@ -101,14 +101,10 @@ public sealed class InventoryService(OrderFlowDbContext db, TimeProvider clock, 
         if (reservation is null) return null;
         var now = clock.GetUtcNow();
         if (!reservation.TransitionTo(target, now)) return Snapshot(reservation);
-        var changed = target == ReservationStatus.Committed
-            ? await db.Inventories.Where(x => x.Id == inventory.Id && x.Reserved >= reservation.Quantity && x.OnHand >= reservation.Quantity)
-                .ExecuteUpdateAsync(setters => setters.SetProperty(x => x.OnHand, x => x.OnHand - reservation.Quantity)
-                    .SetProperty(x => x.Reserved, x => x.Reserved - reservation.Quantity).SetProperty(x => x.UpdatedAtUtc, now), cancellationToken)
-            : await db.Inventories.Where(x => x.Id == inventory.Id && x.Reserved >= reservation.Quantity)
-                .ExecuteUpdateAsync(setters => setters.SetProperty(x => x.Reserved, x => x.Reserved - reservation.Quantity)
-                    .SetProperty(x => x.UpdatedAtUtc, now), cancellationToken);
-        if (changed != 1) throw new DbUpdateConcurrencyException("Inventory changed during transition.");
+        await ApplyQuantitiesAsync(inventory.Id, reservation.Quantity, target, now, cancellationToken);
+        if (target == ReservationStatus.Expired)
+            db.OutboxMessages.Add(OutboxMessage.ForEvent(EventTypes.InventoryReleased, orderId, orderId.ToString("N"), null,
+                new InventoryReleasedPayload(orderId, ReleaseReasons.ReservationExpired, 1), now));
         await db.SaveChangesAsync(cancellationToken);
         await transaction.CommitAsync(cancellationToken);
         return Snapshot(reservation);
@@ -142,6 +138,81 @@ public sealed class InventoryService(OrderFlowDbContext db, TimeProvider clock, 
         return released;
     }
 
+    public async Task<OrderReservationResult> ReserveOrderAsync(Guid orderId, IReadOnlyList<ReservationLine> lines, string correlationId, Guid? causationId, CancellationToken cancellationToken)
+    {
+        if (orderId == Guid.Empty || lines.Count == 0 || lines.Any(x => x.ProductId == Guid.Empty || x.Quantity <= 0) || db.Database.CurrentTransaction is null)
+            throw new InvalidOperationException("Order reservation requires valid lines and an active SQL transaction.");
+        var existing = await db.InventoryReservations.AsNoTracking().Where(x => x.OrderId == orderId).ToListAsync(cancellationToken);
+        if (existing.Count > 0) return new OrderReservationResult(existing.Select(Snapshot).ToArray(), []);
+        // Locks are taken in product order so two multi-line orders cannot deadlock each other.
+        var locked = new List<(ReservationLine Line, OrderFlow.Domain.Inventory.Inventory Inventory)>();
+        var rejected = new List<RejectedLine>();
+        foreach (var line in lines.OrderBy(x => x.ProductId))
+        {
+            var inventory = await LockedInventoryAsync(line.ProductId, cancellationToken);
+            if (inventory is null || !await db.Products.AsNoTracking().AnyAsync(x => x.Id == line.ProductId && x.IsActive, cancellationToken))
+                rejected.Add(new RejectedLine(line.ProductId, line.Quantity, 0, "PRODUCT_UNAVAILABLE"));
+            else if (inventory.Available < line.Quantity)
+                rejected.Add(new RejectedLine(line.ProductId, line.Quantity, inventory.Available, "INSUFFICIENT_STOCK"));
+            else locked.Add((line, inventory));
+        }
+        if (rejected.Count > 0) return new OrderReservationResult([], rejected);
+        var now = clock.GetUtcNow();
+        var expiresAt = now.AddMinutes(options.Value.ReservationMinutes);
+        var reservations = new List<ReservationSnapshot>();
+        foreach (var (line, inventory) in locked)
+        {
+            var changed = await db.Inventories.Where(x => x.Id == inventory.Id && x.OnHand - x.Reserved >= line.Quantity)
+                .ExecuteUpdateAsync(setters => setters.SetProperty(x => x.Reserved, x => x.Reserved + line.Quantity)
+                    .SetProperty(x => x.UpdatedAtUtc, now), cancellationToken);
+            if (changed != 1) throw new DbUpdateConcurrencyException("Inventory changed during reservation.");
+            var reservation = InventoryReservation.Create(Guid.NewGuid(), orderId, line.ProductId, line.Quantity, expiresAt, now);
+            db.InventoryReservations.Add(reservation);
+            reservations.Add(Snapshot(reservation));
+            AddLowStockEvent(inventory, inventory.Available, inventory.Available - line.Quantity, correlationId, now, causationId);
+        }
+        return new OrderReservationResult(reservations, []);
+    }
+
+    public async Task<OrderCommitResult> CommitOrderAsync(Guid orderId, CancellationToken cancellationToken)
+    {
+        if (orderId == Guid.Empty || db.Database.CurrentTransaction is null)
+            throw new InvalidOperationException("Order commit requires an active SQL transaction.");
+        var productIds = await db.InventoryReservations.AsNoTracking().Where(x => x.OrderId == orderId)
+            .OrderBy(x => x.ProductId).Select(x => x.ProductId).ToListAsync(cancellationToken);
+        if (productIds.Count == 0) return new OrderCommitResult(OrderCommitOutcome.NoReservations, [], 0);
+        var inventories = new Dictionary<Guid, Guid>();
+        foreach (var productId in productIds)
+        {
+            var inventory = await LockedInventoryAsync(productId, cancellationToken)
+                ?? throw new DbUpdateConcurrencyException("Inventory disappeared during commit.");
+            inventories[productId] = inventory.Id;
+        }
+        var reservations = await db.InventoryReservations.Where(x => x.OrderId == orderId).ToListAsync(cancellationToken);
+        var ids = reservations.Select(x => x.Id).ToArray();
+        if (reservations.All(x => x.Status == ReservationStatus.Committed)) return new OrderCommitResult(OrderCommitOutcome.AlreadyCommitted, ids, 0);
+        var now = clock.GetUtcNow();
+        if (reservations.All(x => x.Status == ReservationStatus.Active && now < x.ExpiresAtUtc))
+        {
+            foreach (var reservation in reservations)
+            {
+                reservation.TransitionTo(ReservationStatus.Committed, now);
+                await ApplyQuantitiesAsync(inventories[reservation.ProductId], reservation.Quantity, ReservationStatus.Committed, now, cancellationToken);
+            }
+            return new OrderCommitResult(OrderCommitOutcome.Committed, ids, 0);
+        }
+        // A line was released or has lapsed, so stock cannot be committed for the whole order: give up what is still held.
+        var newlyExpired = 0;
+        foreach (var reservation in reservations.Where(x => x.Status == ReservationStatus.Active))
+        {
+            var target = now >= reservation.ExpiresAtUtc ? ReservationStatus.Expired : ReservationStatus.Released;
+            reservation.TransitionTo(target, now);
+            await ApplyQuantitiesAsync(inventories[reservation.ProductId], reservation.Quantity, target, now, cancellationToken);
+            if (target == ReservationStatus.Expired) newlyExpired++;
+        }
+        return new OrderCommitResult(OrderCommitOutcome.NotCommittable, ids, newlyExpired);
+    }
+
     public async Task<int> ExpireDueAsync(int batchSize, CancellationToken cancellationToken)
     {
         if (batchSize is < 1 or > 1000) throw new ArgumentOutOfRangeException(nameof(batchSize));
@@ -168,15 +239,23 @@ public sealed class InventoryService(OrderFlowDbContext db, TimeProvider clock, 
         db.Inventories.FromSqlInterpolated($"SELECT * FROM dbo.Inventories WITH (UPDLOCK, ROWLOCK) WHERE ProductId = {productId}")
             .AsNoTracking().SingleOrDefaultAsync(cancellationToken);
 
-    private void AddLowStockEvent(OrderFlow.Domain.Inventory.Inventory inventory, int before, int after, string correlationId, DateTimeOffset now)
+    private async Task ApplyQuantitiesAsync(Guid inventoryId, int quantity, ReservationStatus target, DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        var changed = target == ReservationStatus.Committed
+            ? await db.Inventories.Where(x => x.Id == inventoryId && x.Reserved >= quantity && x.OnHand >= quantity)
+                .ExecuteUpdateAsync(setters => setters.SetProperty(x => x.OnHand, x => x.OnHand - quantity)
+                    .SetProperty(x => x.Reserved, x => x.Reserved - quantity).SetProperty(x => x.UpdatedAtUtc, now), cancellationToken)
+            : await db.Inventories.Where(x => x.Id == inventoryId && x.Reserved >= quantity)
+                .ExecuteUpdateAsync(setters => setters.SetProperty(x => x.Reserved, x => x.Reserved - quantity)
+                    .SetProperty(x => x.UpdatedAtUtc, now), cancellationToken);
+        if (changed != 1) throw new DbUpdateConcurrencyException("Inventory changed during transition.");
+    }
+
+    private void AddLowStockEvent(OrderFlow.Domain.Inventory.Inventory inventory, int before, int after, string correlationId, DateTimeOffset now, Guid? causationId = null)
     {
         if (before <= inventory.LowStockThreshold || after > inventory.LowStockThreshold) return;
-        db.OutboxMessages.Add(new OutboxMessage
-        {
-            Id = Guid.NewGuid(), EventType = "InventoryLow", EventVersion = 1, AggregateId = inventory.ProductId,
-            CorrelationId = correlationId, Payload = JsonSerializer.Serialize(new { inventory.ProductId, Available = after, inventory.LowStockThreshold }),
-            OccurredAtUtc = now
-        });
+        db.OutboxMessages.Add(OutboxMessage.ForEvent(EventTypes.InventoryLow, inventory.ProductId, correlationId, causationId,
+            new InventoryLowPayload(inventory.ProductId, after, inventory.LowStockThreshold), now));
     }
 
     private static InventorySnapshot Snapshot(OrderFlow.Domain.Inventory.Inventory x) =>

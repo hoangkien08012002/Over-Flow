@@ -77,6 +77,7 @@ public sealed class Coupon
         DiscountType == CouponDiscountType.Fixed ? DiscountValue : subtotal * DiscountValue / 100m,
         2, MidpointRounding.AwayFromZero));
     public void Use() { if (TotalUsageLimit is int limit && UsageCount >= limit) throw new InvalidOperationException("Coupon exhausted."); UsageCount++; }
+    public void ReturnUse(DateTimeOffset now) { if (UsageCount == 0) throw new InvalidOperationException("Coupon has no use to return."); UsageCount--; UpdatedAtUtc = now; }
 }
 
 public sealed class CouponUsage
@@ -88,8 +89,11 @@ public sealed class CouponUsage
     public Guid UserId { get; private set; }
     public decimal DiscountAmount { get; private set; }
     public DateTimeOffset UsedAtUtc { get; private set; }
+    public DateTimeOffset? ReleasedAtUtc { get; private set; }
     public CouponUsage(Guid couponId, Guid orderId, Guid userId, decimal discount, DateTimeOffset now)
     { Id = Guid.NewGuid(); CouponId = couponId; OrderId = orderId; UserId = userId; DiscountAmount = discount; UsedAtUtc = now; }
+    public void Release(DateTimeOffset now)
+    { if (ReleasedAtUtc is not null) throw new InvalidOperationException("Coupon usage already released."); ReleasedAtUtc = now; }
 }
 
 public sealed class IdempotencyRecord

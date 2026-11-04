@@ -61,7 +61,8 @@ public sealed class Order
         {
             (OrderStatus.PendingInventory, OrderStatus.AwaitingPayment or OrderStatus.Rejected or OrderStatus.Cancelled) => true,
             (OrderStatus.AwaitingPayment, OrderStatus.Paid or OrderStatus.PaymentFailed or OrderStatus.Cancelled) => true,
-            (OrderStatus.Paid, OrderStatus.Processing) => true,
+            // Customers cannot reach this edge: Cancel() stops at AwaitingPayment. It is the compensation path after paying for an expired reservation.
+            (OrderStatus.Paid, OrderStatus.Processing or OrderStatus.Cancelled) => true,
             (OrderStatus.Processing, OrderStatus.Shipped) => true,
             (OrderStatus.Shipped, OrderStatus.Delivered) => true,
             _ => false

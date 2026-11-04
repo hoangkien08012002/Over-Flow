@@ -1,5 +1,6 @@
 using System.Security.Claims;
 using System.Text;
+using System.Text.Json.Serialization;
 using System.Threading.RateLimiting;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Authorization;
@@ -14,6 +15,7 @@ using OrderFlow.Application.Catalog;
 using OrderFlow.Application.Inventory;
 using OrderFlow.Infrastructure.Caching;
 using OrderFlow.Infrastructure.Identity;
+using OrderFlow.Infrastructure.Messaging;
 using OrderFlow.Infrastructure.Persistence;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -55,6 +57,12 @@ builder.Services.AddScoped<CheckoutService>();
 builder.Services.AddOptions<OrderingOptions>().Bind(builder.Configuration.GetSection("Ordering"))
     .Validate(x => x.IdempotencyRetentionHours is >= 1 and <= 720, "Idempotency retention must be 1 to 720 hours.")
     .ValidateOnStart();
+builder.Services.AddOptions<RetentionOptions>().Bind(builder.Configuration.GetSection("Retention"))
+    .Validate(x => x.InboxDays >= 1, "Retention:InboxDays must be positive.")
+    .ValidateOnStart();
+// Status values are part of the public contract, so they stay readable and do not shift when an enum is reordered.
+builder.Services.ConfigureHttpJsonOptions(options => options.SerializerOptions.Converters.Add(new JsonStringEnumConverter()));
+builder.Services.Configure<Microsoft.AspNetCore.Mvc.JsonOptions>(options => options.JsonSerializerOptions.Converters.Add(new JsonStringEnumConverter()));
 builder.Services.AddOptions<RedisOptions>().Bind(builder.Configuration.GetSection("Redis"))
     // Scoping keys to the authoritative database keeps environments that share one Redis from reading each other's entries.
     .PostConfigure(x => x.KeyPrefix ??= $"{new SqlConnectionStringBuilder(GetConnectionString()).InitialCatalog}:")
@@ -161,6 +169,7 @@ app.MapPost("/api/v1/auth/logout", async (RefreshRequest request, Authentication
 app.MapCatalogEndpoints();
 app.MapInventoryEndpoints();
 app.MapOrderingEndpoints();
+app.MapAdminEndpoints();
 
 app.Run();
 

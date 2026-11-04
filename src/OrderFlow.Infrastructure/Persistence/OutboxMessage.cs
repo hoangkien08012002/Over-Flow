@@ -1,3 +1,5 @@
+using OrderFlow.Application.Messaging;
+
 namespace OrderFlow.Infrastructure.Persistence;
 
 public sealed class OutboxMessage
@@ -16,4 +18,12 @@ public sealed class OutboxMessage
     public DateTimeOffset? NextAttemptAtUtc { get; set; }
     public DateTimeOffset? LockedUntilUtc { get; set; }
     public Guid? LockId { get; set; }
+    public DateTimeOffset? ParkedAtUtc { get; set; }
+
+    public static OutboxMessage ForEvent<T>(string eventType, Guid aggregateId, string correlationId, Guid? causationId, T payload, DateTimeOffset now)
+    {
+        var envelope = EventSerializer.Create(eventType, aggregateId, correlationId, causationId, payload, now);
+        return new OutboxMessage { Id = envelope.EventId, EventType = eventType, EventVersion = envelope.EventVersion, AggregateId = aggregateId,
+            CorrelationId = correlationId, CausationId = causationId, OccurredAtUtc = now, Payload = EventSerializer.Serialize(envelope) };
+    }
 }
