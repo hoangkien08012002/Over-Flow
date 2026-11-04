@@ -111,7 +111,9 @@ internal sealed class RefundConfiguration : IEntityTypeConfiguration<Refund>
         entity.Property(x => x.Reason).HasMaxLength(500).IsRequired();
         entity.Property(x => x.ProviderReference).HasMaxLength(100);
         entity.Property(x => x.IdempotencyKey).HasMaxLength(100).IsRequired();
+        entity.Property(x => x.CorrelationId).HasMaxLength(100).IsRequired();
         entity.HasIndex(x => x.IdempotencyKey).IsUnique();
+        entity.HasIndex(x => new { x.Status, x.NextAttemptAtUtc });
         // The first release refunds a payment in full, so one payment has one effective refund.
         entity.HasIndex(x => x.PaymentId).IsUnique();
         entity.HasOne<Payment>().WithMany().HasForeignKey(x => x.PaymentId).OnDelete(DeleteBehavior.Restrict);

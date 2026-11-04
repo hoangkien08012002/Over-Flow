@@ -37,6 +37,7 @@ internal sealed class MessagingHarness : IAsyncDisposable
     public DbContextOptions<OrderFlowDbContext> Options { get; }
     public Guid UserId { get; private set; }
     public Guid CategoryId { get; private set; }
+    public void ActAs(Guid userId) => UserId = userId;
     public string KafkaBootstrap => kafkaBootstrap;
     public string Topic(string name) => topicPrefix + name;
     public OrderFlowDbContext NewDb() => new(Options);

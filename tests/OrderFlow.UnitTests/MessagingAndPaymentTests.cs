@@ -57,7 +57,7 @@ public sealed class MessagingAndPaymentTests
         Assert.Equal("inventory.committed", EventTopics.For(EventTypes.InventoryCommitted));
         Assert.Equal("payment.failed.dlq", EventTopics.DeadLetter("payment.failed"));
         Assert.Null(EventTopics.For("Nope"));
-        Assert.Equal(11, EventTopics.All.Count);
+        Assert.Equal(13, EventTopics.All.Count);
     }
 
     [Theory]

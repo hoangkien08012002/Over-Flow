@@ -11,8 +11,8 @@ public static class InventoryEndpoints
         var group = app.MapGroup("/api/v1/inventory").RequireAuthorization("InventoryManager");
         group.MapGet("/{productId:guid}", GetInventory);
         group.MapGet("/{productId:guid}/reservations", GetReservations);
-        group.MapPost("/{productId:guid}/adjust", Adjust);
-        group.MapPut("/{productId:guid}/threshold", SetThreshold);
+        group.MapPost("/{productId:guid}/adjust", Adjust).Audited("inventory.adjust", "Inventory");
+        group.MapPut("/{productId:guid}/threshold", SetThreshold).Audited("inventory.threshold", "Inventory");
     }
 
     private static async Task<IResult> GetInventory(Guid productId, IInventoryService service, HttpContext context, CancellationToken cancellationToken)
@@ -29,6 +29,7 @@ public static class InventoryEndpoints
         if (request.QuantityDelta == 0 || string.IsNullOrWhiteSpace(request.ReasonCode) || request.ReasonCode.Trim().Length > 50 ||
             request.Note?.Trim().Length > 500 || !Guid.TryParse(context.User.FindFirstValue(ClaimTypes.NameIdentifier) ?? context.User.FindFirstValue("sub"), out var actor))
             return Error(context, 400, "VALIDATION_FAILED", "Invalid inventory adjustment");
+        context.Reason(request.ReasonCode.Trim());
         try
         {
             var result = await service.AdjustAsync(productId, request.QuantityDelta, request.ReasonCode, request.Note, actor,

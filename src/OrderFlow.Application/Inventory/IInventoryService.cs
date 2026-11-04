@@ -23,6 +23,10 @@ public interface IInventoryService
     Task<ReservationSnapshot?> TransitionAsync(Guid orderId, Guid productId, ReservationStatus target, CancellationToken cancellationToken);
     // Must be called within the ordering transaction so release and cancellation commit together.
     Task<int> ReleaseForCancellationAsync(Guid orderId, CancellationToken cancellationToken);
+    // Must be called within the staff cancellation transaction: releases held stock and returns committed stock through an audited adjustment, once per reservation.
+    Task<int> CompensateStaffCancellationAsync(Guid orderId, Guid actorUserId, string correlationId, CancellationToken cancellationToken);
+    // Must be called within the return receipt transaction, so the restock commits with the receipt.
+    Task RestockReturnAsync(Guid productId, int quantity, string note, Guid actorUserId, string correlationId, CancellationToken cancellationToken);
     // Must be called within the consumer transaction: every line is reserved or none is, and the result commits with the Inbox record.
     Task<OrderReservationResult> ReserveOrderAsync(Guid orderId, IReadOnlyList<ReservationLine> lines, string correlationId, Guid? causationId, CancellationToken cancellationToken);
     // Must be called within the consumer transaction: every reservation commits or none does.

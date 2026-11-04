@@ -25,9 +25,10 @@ public static class EventConsumers
     public static readonly IReadOnlyList<ConsumerDefinition> All =
     [
         new("inventory", typeof(InventoryEventHandler), [EventTypes.OrderCreated, EventTypes.OrderCancelled, EventTypes.PaymentSucceeded, EventTypes.PaymentFailed]),
-        new("ordering", typeof(OrderingEventHandler), [EventTypes.InventoryReserved, EventTypes.InventoryRejected, EventTypes.InventoryCommitted, EventTypes.InventoryReleased, EventTypes.PaymentSucceeded, EventTypes.PaymentFailed]),
-        new("payment", typeof(PaymentEventHandler), [EventTypes.PaymentRequested, EventTypes.OrderCancelled]),
-        new("notifications", typeof(NotificationEventHandler), [EventTypes.InventoryRejected, EventTypes.PaymentSucceeded, EventTypes.PaymentFailed, EventTypes.OrderCancelled, EventTypes.RefundCompleted, EventTypes.InventoryLow])
+        new("ordering", typeof(OrderingEventHandler), [EventTypes.InventoryReserved, EventTypes.InventoryRejected, EventTypes.InventoryCommitted, EventTypes.InventoryReleased, EventTypes.PaymentSucceeded, EventTypes.PaymentFailed, EventTypes.ShipmentStatusChanged, EventTypes.RefundCompleted]),
+        new("payment", typeof(PaymentEventHandler), [EventTypes.PaymentRequested, EventTypes.OrderCancelled, EventTypes.ShipmentStatusChanged, EventTypes.RefundRequested]),
+        new("returns", typeof(ReturnEventHandler), [EventTypes.RefundCompleted]),
+        new("notifications", typeof(NotificationEventHandler), [EventTypes.InventoryRejected, EventTypes.PaymentSucceeded, EventTypes.PaymentFailed, EventTypes.OrderCancelled, EventTypes.RefundCompleted, EventTypes.InventoryLow, EventTypes.ShipmentStatusChanged])
     ];
 }
 

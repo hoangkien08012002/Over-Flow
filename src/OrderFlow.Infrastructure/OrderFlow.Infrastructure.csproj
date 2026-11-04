@@ -7,6 +7,9 @@
     <PackageReference Include="Microsoft.AspNetCore.Identity.EntityFrameworkCore" />
     <PackageReference Include="StackExchange.Redis" />
     <PackageReference Include="Confluent.Kafka" />
+    <!-- Exports the existing meters to any OTLP collector when Telemetry:OtlpEndpoint is set (D-21). -->
+    <PackageReference Include="OpenTelemetry.Extensions.Hosting" />
+    <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" />
     <ProjectReference Include="../OrderFlow.Application/OrderFlow.Application.csproj" />
     <ProjectReference Include="../OrderFlow.Domain/OrderFlow.Domain.csproj" />
   </ItemGroup>

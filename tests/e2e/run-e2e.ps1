@@ -157,6 +157,10 @@ try {
     $env:Outbox__MaxRetrySeconds = '10'
     $env:Consumers__ReplayPollSeconds = '1'
     $env:Retention__SweepSeconds = '2'
+    $env:Payments__RefundFailCents = '27'
+    $env:Refunds__RetryDelaySeconds = '1'
+    $env:Refunds__PollSeconds = '1'
+    $env:Cors__AllowedOrigins__0 = 'https://shop.example.invalid'
 
     Start-App 'api' 'OrderFlow.Api' | Out-Null
     if (-not (Wait-Until { (Invoke-Api GET '/api/v1/shipping-methods').Status -eq 200 } 60 1000)) { throw 'API did not start; see api.log' }
@@ -270,6 +274,7 @@ try {
     $scenario = 'AC-03 Kafka outage'
     Write-Host "== $scenario =="
     Compose stop kafka 2>&1 | Out-Null
+    Check $scenario 'Readiness reports Kafka as Degraded while staying ready' (Wait-Until { $health = Invoke-Api GET '/health/ready'; $health.Status -eq 200 -and $health.Body.checks.kafka.status -eq 'Degraded' } 30)
     $outage = Place-Order $customerToken $mainProduct 3 'CardSimulation'
     Equal $scenario 'Checkout still commits with Kafka down' 202 $outage.Status
     $cancelledDuringOutage = Place-Order $customerToken $mainProduct 4 'CardSimulation'
@@ -334,6 +339,166 @@ try {
     Check $scenario 'Recent Inbox rows stay' ([int](Sql "SELECT COUNT(*) FROM dbo.InboxMessages") -ge ($inboxBefore - 1))
     Check $scenario 'Worker logged the removal' ((Worker-Logs) -match 'Retention removed')
 
+    $scenario = 'Phase 10 shipping, reviews and return'
+    Write-Host "== $scenario =="
+    $fulfilProduct = New-Product $adminToken $category.Body.id 'FULFIL' 200000 5 $adminToken
+    $fulfil = Place-Order $customerToken $fulfilProduct 2 'COD'
+    Equal $scenario 'Order reaches Processing' 'Processing' (Wait-OrderStatus $fulfil.Order.id 'Processing' $customerToken)
+    Equal $scenario 'Customers cannot create shipments' 403 (Invoke-Api POST '/api/v1/shipments' @{ orderId = $fulfil.Order.id } $customerToken).Status
+    $shipment = Invoke-Api POST '/api/v1/shipments' @{ orderId = $fulfil.Order.id } $adminToken
+    Equal $scenario 'Shipment is created' 201 $shipment.Status
+    Check $scenario 'Shipment has a tracking code' ($shipment.Body.trackingCode -like 'OFT-*')
+    Equal $scenario 'A skipped step is refused' 'INVALID_STATE_TRANSITION' (Invoke-Api POST "/api/v1/shipments/$($shipment.Body.id)/status" @{ status = 'Delivered' } $adminToken).Body.code
+    Equal $scenario 'Warehouse prepares the order' 200 (Invoke-Api POST "/api/v1/shipments/$($shipment.Body.id)/status" @{ status = 'ReadyToShip' } $adminToken).Status
+    Equal $scenario 'Carrier dispatches' 200 (Invoke-Api POST "/api/v1/shipments/$($shipment.Body.id)/status" @{ status = 'Shipped' } $adminToken).Status
+    Equal $scenario 'Order follows to Shipped through Kafka' 'Shipped' (Wait-OrderStatus $fulfil.Order.id 'Shipped' $customerToken)
+    Equal $scenario 'A shipped order cannot be cancelled by staff' 409 (Invoke-Api POST "/api/v1/admin/orders/$($fulfil.Order.id)/cancel" @{ reason = 'Too late' } $adminToken).Status
+    Equal $scenario 'Carrier delivers' 200 (Invoke-Api POST "/api/v1/shipments/$($shipment.Body.id)/status" @{ status = 'Delivered' } $adminToken).Status
+    Equal $scenario 'Order follows to Delivered' 'Delivered' (Wait-OrderStatus $fulfil.Order.id 'Delivered' $customerToken)
+    Check $scenario 'COD is collected on delivery' (Wait-Until { (Sql "SELECT SettlementStatus FROM dbo.Payments WHERE OrderId = '$($fulfil.Order.id)'") -eq 'Collected' } 60)
+    Check $scenario 'Customer is told about dispatch and delivery' (Wait-Until { (Sql "SELECT COUNT(*) FROM dbo.Notifications WHERE OrderId = '$($fulfil.Order.id)' AND Type = 'ShipmentStatusChanged'") -eq '2' } 60)
+    Equal $scenario 'Customer can track the shipment' 'Delivered' (Invoke-Api GET "/api/v1/orders/$($fulfil.Order.id)/shipment" -token $customerToken).Body.status
+    Equal $scenario 'Another customer cannot see it' 404 (Invoke-Api GET "/api/v1/orders/$($fulfil.Order.id)/shipment" -token $strangerToken).Status
+
+    $orderItem = (Invoke-Api GET "/api/v1/orders/$($fulfil.Order.id)" -token $customerToken).Body.items[0]
+    $review = Invoke-Api POST "/api/v1/products/$fulfilProduct/reviews" @{ orderItemId = $orderItem.id; rating = 4; comment = 'Solid' } $customerToken
+    Equal $scenario 'Verified purchase can review' 201 $review.Status
+    Equal $scenario 'A second review of the line is refused' 'REVIEW_ALREADY_EXISTS' (Invoke-Api POST "/api/v1/products/$fulfilProduct/reviews" @{ orderItemId = $orderItem.id; rating = 1 } $customerToken).Body.code
+    Equal $scenario 'A stranger cannot review this purchase' 404 (Invoke-Api POST "/api/v1/products/$fulfilProduct/reviews" @{ orderItemId = $orderItem.id; rating = 1 } $strangerToken).Status
+    Equal $scenario 'Summary is public' 4 (Invoke-Api GET "/api/v1/products/$fulfilProduct/reviews").Body.summary.averageRating
+    Equal $scenario 'Admin hides the review with a reason' 200 (Invoke-Api POST "/api/v1/admin/reviews/$($review.Body.id)/moderate" @{ status = 'Hidden'; reason = 'Off topic' } $adminToken).Status
+    Equal $scenario 'Hidden review leaves the public list' 0 (Invoke-Api GET "/api/v1/products/$fulfilProduct/reviews").Body.summary.count
+    Equal $scenario 'The text is kept for audit' 'Solid' (Sql "SELECT Comment FROM dbo.Reviews WHERE Id = '$($review.Body.id)'")
+
+    $request = Invoke-Api POST "/api/v1/orders/$($fulfil.Order.id)/returns" @{ reason = 'Wrong size' } $customerToken
+    Equal $scenario 'Customer requests a return' 201 $request.Status
+    Equal $scenario 'A second open return is refused' 'RETURN_ALREADY_EXISTS' (Invoke-Api POST "/api/v1/orders/$($fulfil.Order.id)/returns" @{ reason = 'Again' } $customerToken).Body.code
+    Equal $scenario 'Staff approves' 200 (Invoke-Api POST "/api/v1/admin/returns/$($request.Body.id)/approve" -token $adminToken).Status
+    $receipt = @{ items = @(@{ orderItemId = $request.Body.items[0].orderItemId; restock = $true }) }
+    Equal $scenario 'Warehouse receives the items' 200 (Invoke-Api POST "/api/v1/admin/returns/$($request.Body.id)/receive" $receipt $adminToken).Status
+    Equal $scenario 'A repeated receipt is harmless' 200 (Invoke-Api POST "/api/v1/admin/returns/$($request.Body.id)/receive" $receipt $adminToken).Status
+    $stock = (Invoke-Api GET "/api/v1/inventory/$fulfilProduct" -token $adminToken).Body
+    Equal $scenario 'Stock comes back once' '5/0' "$($stock.onHand)/$($stock.reserved)"
+    Equal $scenario 'Restock is audited' 1 (Sql "SELECT COUNT(*) FROM dbo.InventoryAdjustments WHERE ReasonCode = 'RETURN_RESTOCK'")
+    Equal $scenario 'Order ends Refunded' 'Refunded' (Wait-OrderStatus $fulfil.Order.id 'Refunded' $customerToken)
+    Check $scenario 'Return follows to Refunded' (Wait-Until { (Sql "SELECT Status FROM dbo.ReturnRequests WHERE Id = '$($request.Body.id)'") -eq 'Refunded' } 60)
+    Equal $scenario 'The whole order is refunded' 430000 ([decimal](Sql "SELECT Amount FROM dbo.Refunds WHERE OrderId = '$($fulfil.Order.id)'"))
+    Equal $scenario 'Exactly one refund event' 1 (Sql "SELECT COUNT(*) FROM dbo.OutboxMessages WHERE AggregateId = '$($fulfil.Order.id)' AND EventType = 'RefundCompleted'")
+    Equal $scenario 'Staff closes the return' 'Closed' (Invoke-Api POST "/api/v1/admin/returns/$($request.Body.id)/close" -token $adminToken).Body.status
+    $late = Place-Order $customerToken $fulfilProduct 1 'COD'
+    Wait-OrderStatus $late.Order.id 'Processing' $customerToken | Out-Null
+    $lateShipment = (Invoke-Api POST '/api/v1/shipments' @{ orderId = $late.Order.id } $adminToken).Body.id
+    foreach ($status in 'ReadyToShip', 'Shipped', 'Delivered') { Invoke-Api POST "/api/v1/shipments/$lateShipment/status" @{ status = $status } $adminToken | Out-Null }
+    Wait-OrderStatus $late.Order.id 'Delivered' $customerToken | Out-Null
+    Sql "UPDATE dbo.OrderStatusHistories SET ChangedAtUtc = DATEADD(hour, -169, SYSUTCDATETIME()) WHERE OrderId = '$($late.Order.id)' AND ToStatus = 'Delivered'" | Out-Null
+    Equal $scenario 'A return after 7 days is refused' 'RETURN_WINDOW_CLOSED' (Invoke-Api POST "/api/v1/orders/$($late.Order.id)/returns" @{ reason = 'Too late' } $customerToken).Body.code
+
+    $scenario = 'Phase 10 staff cancellation'
+    Write-Host "== $scenario =="
+    $staffProduct = New-Product $adminToken $category.Body.id 'STAFF' 300000 4 $adminToken
+    $staffOrder = Place-Order $customerToken $staffProduct 2 'CardSimulation'
+    Equal $scenario 'Order reaches Processing' 'Processing' (Wait-OrderStatus $staffOrder.Order.id 'Processing' $customerToken)
+    $stock = (Invoke-Api GET "/api/v1/inventory/$staffProduct" -token $adminToken).Body
+    Equal $scenario 'Stock was committed' '2/0' "$($stock.onHand)/$($stock.reserved)"
+    Invoke-Api POST '/api/v1/shipments' @{ orderId = $staffOrder.Order.id } $adminToken | Out-Null
+    Equal $scenario 'A customer cannot use the staff route' 403 (Invoke-Api POST "/api/v1/admin/orders/$($staffOrder.Order.id)/cancel" @{ reason = 'Mine' } $customerToken).Status
+    Equal $scenario 'A reason is required' 400 (Invoke-Api POST "/api/v1/admin/orders/$($staffOrder.Order.id)/cancel" @{ reason = '' } $adminToken).Status
+    Equal $scenario 'Staff cancels' 200 (Invoke-Api POST "/api/v1/admin/orders/$($staffOrder.Order.id)/cancel" @{ reason = 'Damaged in warehouse' } $adminToken).Status
+    Equal $scenario 'Repeating has no further effect' 200 (Invoke-Api POST "/api/v1/admin/orders/$($staffOrder.Order.id)/cancel" @{ reason = 'Again' } $adminToken).Status
+    $stock = (Invoke-Api GET "/api/v1/inventory/$staffProduct" -token $adminToken).Body
+    Equal $scenario 'Committed stock returns once' '4/0' "$($stock.onHand)/$($stock.reserved)"
+    Equal $scenario 'Shipment is cancelled' 'Cancelled' (Sql "SELECT Status FROM dbo.Shipments WHERE OrderId = '$($staffOrder.Order.id)'")
+    Check $scenario 'Payment is refunded' (Wait-Until { (Sql "SELECT Status FROM dbo.Payments WHERE OrderId = '$($staffOrder.Order.id)'") -eq 'Refunded' } 60)
+    Check $scenario 'Customer is told about the refund' (Wait-Until { (Sql "SELECT COUNT(*) FROM dbo.Notifications WHERE OrderId = '$($staffOrder.Order.id)' AND Type = 'RefundCompleted'") -eq '1' } 60)
+    Equal $scenario 'Stock stays right after OrderCancelled is consumed' '4/0' "$(((Invoke-Api GET "/api/v1/inventory/$staffProduct" -token $adminToken).Body).onHand)/0"
+    Equal $scenario 'Order stays Cancelled' 'Cancelled' (Get-OrderStatus $staffOrder.Order.id $customerToken)
+    $auditRows = (Invoke-Api GET "/api/v1/admin/audit-logs?targetType=Order&targetId=$($staffOrder.Order.id)" -token $adminToken).Body.items
+    Check $scenario 'Audit log names the action and reason' (@($auditRows | Where-Object { $_.action -eq 'order.staff-cancel' -and $_.reason -eq 'Damaged in warehouse' }).Count -eq 1)
+    Equal $scenario 'Customers cannot read the audit log' 403 (Invoke-Api GET '/api/v1/admin/audit-logs' -token $customerToken).Status
+
+    $scenario = 'Phase 10 administration and wishlist'
+    Write-Host "== $scenario =="
+    $couponBody = @{ code = "ADMIN$runId"; discountType = 'Percentage'; discountValue = 10; minimumSubtotal = 0; validFromUtc = (Get-Date).ToUniversalTime().AddDays(-1).ToString('o'); validUntilUtc = (Get-Date).ToUniversalTime().AddDays(1).ToString('o'); totalUsageLimit = 5; perUserUsageLimit = 5 }
+    $adminCoupon = Invoke-Api POST '/api/v1/admin/coupons' $couponBody $adminToken
+    Equal $scenario 'Admin creates a coupon' 201 $adminCoupon.Status
+    Equal $scenario 'A duplicate code conflicts' 'COUPON_CODE_ALREADY_EXISTS' (Invoke-Api POST '/api/v1/admin/coupons' $couponBody $adminToken).Body.code
+    $discounted = Place-Order $customerToken $mainProduct 1 'COD' -couponCode "ADMIN$runId"
+    Equal $scenario 'The coupon applies at checkout' 10000 $discounted.Order.discountTotal
+    Wait-OrderStatus $discounted.Order.id 'Processing' $customerToken | Out-Null
+    $mainSold++
+    Equal $scenario 'Usage is reported' 1 (Invoke-Api GET "/api/v1/admin/coupons/$($adminCoupon.Body.id)" -token $adminToken).Body.activeUsages
+    Equal $scenario 'A stale version conflicts' 'CONCURRENCY_CONFLICT' (Invoke-Api PUT "/api/v1/admin/coupons/$($adminCoupon.Body.id)/activation" @{ isEnabled = $false; version = $adminCoupon.Body.version } $adminToken).Body.code
+    $method = Invoke-Api POST '/api/v1/admin/shipping-methods' @{ code = "EX$runId"; name = 'Express'; fee = 50000; currencyCode = 'VND' } $adminToken
+    Equal $scenario 'Admin adds a shipping method' 201 $method.Status
+    Check $scenario 'It is offered at checkout' (@((Invoke-Api GET '/api/v1/shipping-methods').Body | Where-Object id -eq $method.Body.id).Count -eq 1)
+    Equal $scenario 'Wishlist add' 204 (Invoke-Api PUT "/api/v1/wishlist/$mainProduct" -token $customerToken).Status
+    Equal $scenario 'Wishlist add is idempotent' 204 (Invoke-Api PUT "/api/v1/wishlist/$mainProduct" -token $customerToken).Status
+    Equal $scenario 'Wishlist holds one row' 1 @((Invoke-Api GET '/api/v1/wishlist' -token $customerToken).Body.items).Count
+    Equal $scenario 'Wishlist is private' 0 @((Invoke-Api GET '/api/v1/wishlist' -token $strangerToken).Body.items).Count
+    Equal $scenario 'Wishlist remove' 204 (Invoke-Api DELETE "/api/v1/wishlist/$mainProduct" -token $customerToken).Status
+
+    $scenario = 'Phase 11 operations'
+    Write-Host "== $scenario =="
+    $probe = Invoke-WebRequest "$api/health/live" -SkipHttpErrorCheck
+    Equal $scenario 'Liveness answers' 200 ([int]$probe.StatusCode)
+    Equal $scenario 'Readiness reports SQL Server' 'Healthy' (Invoke-Api GET '/health/ready').Body.checks.sql.status
+    Check $scenario 'Readiness reports Redis and Kafka' ($null -ne (Invoke-Api GET '/health/ready').Body.checks.redis -and $null -ne (Invoke-Api GET '/health/ready').Body.checks.kafka)
+    $page = Invoke-WebRequest "$api/api/v1/shipping-methods" -SkipHttpErrorCheck
+    Equal $scenario 'Security header: nosniff' 'nosniff' "$($page.Headers['X-Content-Type-Options'])"
+    Equal $scenario 'Security header: frames denied' 'DENY' "$($page.Headers['X-Frame-Options'])"
+    Check $scenario 'Security header: CSP' ("$($page.Headers['Content-Security-Policy'])" -match "default-src 'none'")
+    Equal $scenario 'Swagger is not served in Production' 404 ([int](Invoke-WebRequest "$api/swagger/index.html" -SkipHttpErrorCheck).StatusCode)
+    $preflight = Invoke-WebRequest "$api/api/v1/auth/refresh" -Method Options -SkipHttpErrorCheck -Headers @{ Origin = 'https://shop.example.invalid'; 'Access-Control-Request-Method' = 'POST'; 'Access-Control-Request-Headers' = 'x-refresh-token-transport' }
+    Equal $scenario 'CORS admits the configured origin' 'https://shop.example.invalid' "$($preflight.Headers['Access-Control-Allow-Origin'])"
+    $foreign = Invoke-WebRequest "$api/api/v1/auth/refresh" -Method Options -SkipHttpErrorCheck -Headers @{ Origin = 'https://evil.example.invalid'; 'Access-Control-Request-Method' = 'POST' }
+    Check $scenario 'CORS refuses any other origin' (-not $foreign.Headers.ContainsKey('Access-Control-Allow-Origin'))
+    $cookieHeaders = @{ 'X-Refresh-Token-Transport' = 'cookie' }
+    $cookieLogin = Invoke-WebRequest "$api/api/v1/auth/login" -Method Post -ContentType 'application/json' -Headers $cookieHeaders -SkipHttpErrorCheck -Body (@{ email = "customer-$runId@example.invalid"; password = 'StrongPassword123!' } | ConvertTo-Json)
+    $setCookie = "$($cookieLogin.Headers['Set-Cookie'])"
+    Check $scenario 'D-20: refresh cookie is HttpOnly, Secure, and SameSite=Strict' ($setCookie -match '(?i)httponly' -and $setCookie -match '(?i)secure' -and $setCookie -match '(?i)samesite=strict')
+    Check $scenario 'D-20: the token is not in the response body' (-not ($cookieLogin.Content -match 'refreshToken'))
+    $cookieValue = $setCookie.Split(';')[0]
+    $rotated = Invoke-WebRequest "$api/api/v1/auth/refresh" -Method Post -ContentType 'application/json' -Headers ($cookieHeaders + @{ Cookie = $cookieValue }) -SkipHttpErrorCheck -Body '{}'
+    Equal $scenario 'D-20: the cookie refreshes the session' 200 ([int]$rotated.StatusCode)
+    Check $scenario 'D-20: the cookie rotates' ("$($rotated.Headers['Set-Cookie'])".Split(';')[0] -ne $cookieValue)
+    $trace = "e2e-trace-$runId"
+    $traceCart = Invoke-Api POST '/api/v1/cart/items' @{ productId = $mainProduct; quantity = 1 } $customerToken
+    $traced = Invoke-Api POST '/api/v1/orders' @{ cartId = $traceCart.Body.id; shippingMethodId = $shippingMethodId; paymentMethod = 'CardSimulation'; couponCode = $null; deliveryAddress = $address } $customerToken @{ 'Idempotency-Key' = "trace-$runId-key"; 'X-Correlation-Id' = $trace }
+    Equal $scenario 'Traced order reaches Processing' 'Processing' (Wait-OrderStatus $traced.Body.id 'Processing' $customerToken)
+    $mainSold++
+    Check $scenario 'Trace: notification is written' (Wait-Until { (Sql "SELECT COUNT(*) FROM dbo.Notifications WHERE OrderId = '$($traced.Body.id)' AND Type = 'PaymentSucceeded'") -eq '1' } 60)
+    Start-Sleep -Seconds 2
+    Check $scenario 'Trace: API request log carries the correlation ID' ((Get-Content (Join-Path $LogDir 'api.log') | Where-Object { $_ -match $trace -and $_ -match 'HTTP POST /api/v1/orders' }).Count -ge 1)
+    $traceLines = @(Get-ChildItem $LogDir -Filter 'worker-*.log' | Where-Object { $_.Name -notlike '*.err.log' } | ForEach-Object { Get-Content $_.FullName } | Where-Object { $_ -match $trace })
+    foreach ($consumer in 'inventory', 'ordering', 'payment', 'notifications') { Check $scenario "Trace: $consumer logs the correlation ID" (@($traceLines | Where-Object { $_ -match "Consumer $consumer processed" }).Count -ge 1) }
+    Check $scenario 'Trace: outbox publishing logs the correlation ID' (@($traceLines | Where-Object { $_ -match 'Published OrderCreated' }).Count -ge 1)
+    Check $scenario 'Trace: the notification log carries it' (@($traceLines | Where-Object { $_ -match 'Notification ' }).Count -ge 1)
+    Equal $scenario 'Trace: one correlation ID across every event of the order' $trace (Sql "SELECT MIN(CorrelationId) FROM dbo.OutboxMessages WHERE AggregateId = '$($traced.Body.id)'")
+    Equal $scenario 'Trace: no other correlation ID' 1 (Sql "SELECT COUNT(DISTINCT CorrelationId) FROM dbo.OutboxMessages WHERE AggregateId = '$($traced.Body.id)'")
+    Check $scenario 'Privileged catalog changes are audited' (@((Invoke-Api GET "/api/v1/admin/audit-logs?targetType=Product&targetId=$mainProduct" -token $adminToken).Body.items | Where-Object action -eq 'product.create').Count -eq 1)
+
+    $scenario = 'D-23 failed refund queue'
+    Write-Host "== $scenario =="
+    # Workers run with Payments__RefundFailCents=27, so a total ending in .27 fails its refund until a Worker runs without it.
+    $failingProduct = New-Product $adminToken $category.Body.id 'REFUNDFAIL' 100000.27 3 $adminToken
+    $failing = Place-Order $customerToken $failingProduct 1 'CardSimulation'
+    Equal $scenario 'Order reaches Processing' 'Processing' (Wait-OrderStatus $failing.Order.id 'Processing' $customerToken)
+    Equal $scenario 'Staff cancels' 200 (Invoke-Api POST "/api/v1/admin/orders/$($failing.Order.id)/cancel" @{ reason = 'Refund path check' } $adminToken).Status
+    Check $scenario 'Refund enters the Admin queue after its attempts' (Wait-Until { @((Invoke-Api GET '/api/v1/admin/failed-refunds' -token $adminToken).Body.items | Where-Object orderId -eq $failing.Order.id).Count -eq 1 } 120)
+    $failedRefund = (Invoke-Api GET '/api/v1/admin/failed-refunds' -token $adminToken).Body.items | Where-Object orderId -eq $failing.Order.id
+    Equal $scenario 'Attempts stop at the configured bound' 3 $failedRefund.attemptCount
+    Equal $scenario 'Payment shows RefundFailed' 'RefundFailed' (Sql "SELECT Status FROM dbo.Payments WHERE OrderId = '$($failing.Order.id)'")
+    Check $scenario 'The alert is logged' ((Worker-Logs) -match 'needs an Admin')
+    Equal $scenario 'Customers cannot see the queue' 403 (Invoke-Api GET '/api/v1/admin/failed-refunds' -token $customerToken).Status
+    foreach ($name in @($processes.Keys | Where-Object { $_ -like 'worker-*' })) { if (-not $processes[$name].HasExited) { Stop-Process -Id $processes[$name].Id -Force } }
+    Remove-Item Env:Payments__RefundFailCents
+    Start-Worker | Out-Null
+    Equal $scenario 'Admin retries after the provider recovers' 202 (Invoke-Api POST "/api/v1/admin/failed-refunds/$($failedRefund.id)/retry" -token $adminToken).Status
+    Check $scenario 'The retry completes' (Wait-Until { (Sql "SELECT Status FROM dbo.Refunds WHERE OrderId = '$($failing.Order.id)'") -eq 'Succeeded' } 90)
+    Equal $scenario 'It is the same refund with one identity' $failedRefund.id (Sql "SELECT CAST(Id AS nvarchar(36)) FROM dbo.Refunds WHERE OrderId = '$($failing.Order.id)'")
+    Equal $scenario 'One refund event is written' 1 (Sql "SELECT COUNT(*) FROM dbo.OutboxMessages WHERE AggregateId = '$($failing.Order.id)' AND EventType = 'RefundCompleted'")
+    Equal $scenario 'Payment ends Refunded' 'Refunded' (Sql "SELECT Status FROM dbo.Payments WHERE OrderId = '$($failing.Order.id)'")
+
     $scenario = 'Final invariants'
     Write-Host "== $scenario =="
     Check $scenario 'Outbox drains completely' (Wait-Until { (Sql "SELECT COUNT(*) FROM dbo.OutboxMessages WHERE ProcessedAtUtc IS NULL") -eq '0' } 120)
@@ -342,9 +507,10 @@ try {
     Equal $scenario 'Main product stock is exact with nothing reserved' "$(100 - $mainSold)/0" "$($stock.onHand)/$($stock.reserved)"
     Equal $scenario 'No active reservations remain' 0 (Sql "SELECT COUNT(*) FROM dbo.InventoryReservations WHERE Status = 'Active'")
     Equal $scenario 'No order has more than one payment' 0 (Sql "SELECT COUNT(*) FROM (SELECT OrderId FROM dbo.Payments GROUP BY OrderId HAVING COUNT(*) > 1) x")
+    Equal $scenario 'No refund is left pending' 0 (Sql "SELECT COUNT(*) FROM dbo.Refunds WHERE Status <> 'Succeeded'")
     Equal $scenario 'No orders are stuck mid-workflow' 0 (Sql "SELECT COUNT(*) FROM dbo.Orders WHERE Status IN ('PendingInventory','AwaitingPayment','Paid')")
     $combined = (Get-ChildItem $LogDir -Filter '*.log' | ForEach-Object { Get-Content -Raw $_.FullName }) -join "`n"
-    Check $scenario 'Logs contain no secrets or addresses' (-not ($combined -match [regex]::Escape($password) -or $combined -match 'Line 1' -or $combined -match 'accessToken'))
+    Check $scenario 'Logs contain no secrets or addresses' (-not ($combined -match [regex]::Escape($password) -or $combined -match 'Line 1' -or $combined -match 'accessToken' -or $combined -match 'orderflow_refresh' -or $combined -match 'StrongPassword'))
     Check $scenario 'Worker log shows outbox failure and recovery' ((Worker-Logs) -match 'failed on attempt' -and (Worker-Logs) -match 'on attempt [2-9]')
 }
 catch {

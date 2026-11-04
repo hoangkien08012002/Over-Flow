@@ -41,6 +41,13 @@ public sealed class ShippingMethod
     public byte[] RowVersion { get; private set; } = [];
     public ShippingMethod(Guid id, string code, string name, decimal fee, string currency, DateTimeOffset now)
     { Id = id; Code = code; Name = name; Fee = fee; CurrencyCode = currency; IsActive = true; CreatedAtUtc = now; UpdatedAtUtc = now; }
+    // An order keeps its own fee and method name, so changing a method never alters past orders.
+    public void Update(string name, decimal fee, string currency, bool isActive, DateTimeOffset now)
+    {
+        if (string.IsNullOrWhiteSpace(name) || name.Trim().Length > 150 || fee < 0 || currency is not { Length: 3 } || now.Offset != TimeSpan.Zero)
+            throw new ArgumentException("Invalid shipping method.");
+        Name = name.Trim(); Fee = fee; CurrencyCode = currency; IsActive = isActive; UpdatedAtUtc = now;
+    }
 }
 
 public enum CouponDiscountType { Fixed, Percentage }
@@ -73,6 +80,16 @@ public sealed class Coupon
             MinimumSubtotal = minimumSubtotal, ValidFromUtc = validFromUtc, ValidUntilUtc = validUntilUtc,
             TotalUsageLimit = totalLimit, PerUserUsageLimit = perUserLimit, IsEnabled = true, CreatedAtUtc = now, UpdatedAtUtc = now };
     }
+    // The code stays fixed, because usage history and support conversations refer to it. Past orders keep their own discount.
+    public void Update(CouponDiscountType type, decimal value, decimal minimumSubtotal, DateTimeOffset validFromUtc, DateTimeOffset validUntilUtc, int? totalLimit, int? perUserLimit, bool isEnabled, DateTimeOffset now)
+    {
+        if (value <= 0 || type == CouponDiscountType.Percentage && value > 100 || minimumSubtotal < 0 || validUntilUtc <= validFromUtc ||
+            totalLimit is <= 0 || perUserLimit is <= 0 || totalLimit < UsageCount || now.Offset != TimeSpan.Zero || validFromUtc.Offset != TimeSpan.Zero || validUntilUtc.Offset != TimeSpan.Zero)
+            throw new ArgumentException("Invalid coupon.");
+        DiscountType = type; DiscountValue = value; MinimumSubtotal = minimumSubtotal; ValidFromUtc = validFromUtc; ValidUntilUtc = validUntilUtc;
+        TotalUsageLimit = totalLimit; PerUserUsageLimit = perUserLimit; IsEnabled = isEnabled; UpdatedAtUtc = now;
+    }
+    public void SetEnabled(bool isEnabled, DateTimeOffset now) { IsEnabled = isEnabled; UpdatedAtUtc = now; }
     public decimal CalculateDiscount(decimal subtotal) => Math.Min(subtotal, decimal.Round(
         DiscountType == CouponDiscountType.Fixed ? DiscountValue : subtotal * DiscountValue / 100m,
         2, MidpointRounding.AwayFromZero));

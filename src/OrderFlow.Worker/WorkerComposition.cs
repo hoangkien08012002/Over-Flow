@@ -6,6 +6,7 @@ using Microsoft.Extensions.Options;
 using OrderFlow.Application.Inventory;
 using OrderFlow.Application.Notifications;
 using OrderFlow.Application.Payments;
+using OrderFlow.Infrastructure;
 using OrderFlow.Infrastructure.Messaging;
 using OrderFlow.Infrastructure.Persistence;
 
@@ -19,6 +20,7 @@ public static class WorkerComposition
             ?? throw new InvalidOperationException("ConnectionStrings:OrderFlow or ORDERFLOW_SQL_CONNECTION is required.");
         services.AddDbContext<OrderFlowDbContext>(options => options.UseSqlServer(connection));
         services.AddSingleton(TimeProvider.System);
+        services.AddOrderFlowTelemetry(configuration, "OrderFlow.Worker");
 
         services.AddOptions<KafkaOptions>().Bind(configuration.GetSection("Kafka"))
             .Validate(x => !string.IsNullOrWhiteSpace(x.BootstrapServers), "Kafka:BootstrapServers is required.")
@@ -46,6 +48,9 @@ public static class WorkerComposition
             .Validate(x => x.SweepSeconds >= 1 && x.BatchSize is >= 1 and <= 1000, "Reservation expiry settings are out of range.")
             .ValidateOnStart();
 
+        services.AddOptions<RefundOptions>().Bind(configuration.GetSection("Refunds"))
+            .Validate(x => x.MaxAttempts is >= 1 and <= 20 && x.RetryDelaySeconds >= 0 && x.PollSeconds >= 1 && x.BatchSize is >= 1 and <= 1000, "Refund retry settings are out of range.")
+            .ValidateOnStart();
         services.AddSingleton(configuration.GetSection("Payments").Get<PaymentSimulationOptions>() ?? new PaymentSimulationOptions());
         services.AddSingleton<IPaymentStrategy, CodPaymentStrategy>();
         services.AddSingleton<IPaymentStrategy, BankTransferSimulationStrategy>();
@@ -68,6 +73,7 @@ public static class WorkerComposition
         services.AddScoped<InventoryEventHandler>();
         services.AddScoped<OrderingEventHandler>();
         services.AddScoped<PaymentEventHandler>();
+        services.AddScoped<ReturnEventHandler>();
         services.AddScoped<NotificationEventHandler>();
 
         services.AddHostedService<OutboxPublisherService>();
@@ -75,6 +81,7 @@ public static class WorkerComposition
             services.AddSingleton<IHostedService>(sp => ActivatorUtilities.CreateInstance<EventConsumerService>(sp, definition));
         services.AddHostedService<ReservationExpiryService>();
         services.AddHostedService<FailedMessageReplayService>();
+        services.AddHostedService<RefundRetryService>();
         services.AddHostedService<MessagingRetentionService>();
         return services;
     }

@@ -4,6 +4,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using OrderFlow.Application.Inventory;
 using OrderFlow.Infrastructure.Messaging;
+using OrderFlow.Infrastructure.Persistence;
 
 namespace OrderFlow.Worker;
 
@@ -117,6 +118,29 @@ public sealed class MessagingRetentionService(IServiceScopeFactory scopes, IOpti
                 }
                 catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { return; }
                 catch (Exception ex) { logger.LogError("Retention sweep failed: {ErrorType}", ex.GetType().Name); }
+            } while (await timer.WaitForNextTickAsync(stoppingToken));
+        }
+        catch (OperationCanceledException) { }
+    }
+}
+
+public sealed class RefundRetryService(IServiceScopeFactory scopes, IOptions<RefundOptions> options, ILogger<RefundRetryService> logger) : BackgroundService
+{
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        await Task.Yield();
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(options.Value.PollSeconds));
+        try
+        {
+            do
+            {
+                try
+                {
+                    await using var scope = scopes.CreateAsyncScope();
+                    await scope.ServiceProvider.GetRequiredService<PaymentService>().RetryDueRefundsAsync(stoppingToken);
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { return; }
+                catch (Exception ex) { logger.LogError("Refund retry poll failed: {ErrorType}", ex.GetType().Name); }
             } while (await timer.WaitForNextTickAsync(stoppingToken));
         }
         catch (OperationCanceledException) { }

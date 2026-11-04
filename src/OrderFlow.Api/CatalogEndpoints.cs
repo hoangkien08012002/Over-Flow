@@ -14,16 +14,16 @@ public static class CatalogEndpoints
     {
         var categories = app.MapGroup("/api/v1/categories");
         categories.MapGet("/", ListCategories);
-        categories.MapPost("/", CreateCategory).RequireAuthorization("Admin");
-        categories.MapPut("/{id:guid}", UpdateCategory).RequireAuthorization("Admin");
-        categories.MapPut("/{id:guid}/activation", SetCategoryActivation).RequireAuthorization("Admin");
+        categories.MapPost("/", CreateCategory).RequireAuthorization("Admin").Audited("category.create", "Category");
+        categories.MapPut("/{id:guid}", UpdateCategory).RequireAuthorization("Admin").Audited("category.update", "Category");
+        categories.MapPut("/{id:guid}/activation", SetCategoryActivation).RequireAuthorization("Admin").Audited("category.activation", "Category");
 
         var products = app.MapGroup("/api/v1/products");
-        products.MapGet("/", ListProducts);
+        products.MapGet("/", ListProducts).RequireRateLimiting("search");
         products.MapGet("/{id:guid}", GetProduct);
-        products.MapPost("/", CreateProduct).RequireAuthorization("Admin");
-        products.MapPut("/{id:guid}", UpdateProduct).RequireAuthorization("Admin");
-        products.MapPut("/{id:guid}/activation", SetProductActivation).RequireAuthorization("Admin");
+        products.MapPost("/", CreateProduct).RequireAuthorization("Admin").Audited("product.create", "Product");
+        products.MapPut("/{id:guid}", UpdateProduct).RequireAuthorization("Admin").Audited("product.update", "Product");
+        products.MapPut("/{id:guid}/activation", SetProductActivation).RequireAuthorization("Admin").Audited("product.activation", "Product");
     }
 
     private static async Task<IResult> ListCategories(OrderFlowDbContext db, IReadCache cache, HttpContext context, CancellationToken cancellationToken)
@@ -50,6 +50,7 @@ public static class CatalogEndpoints
         try { await db.SaveChangesAsync(cancellationToken); }
         catch (DbUpdateException exception) when (IsUniqueViolation(exception)) { return Error(context, 409, "SLUG_ALREADY_EXISTS", "Category slug already exists"); }
         await cache.InvalidateAsync([CatalogCache.CategoriesKey]);
+        context.Target(category.Id);
         return Results.Created($"/api/v1/categories/{category.Id}", ToCategoryResponse(category));
     }
 
@@ -165,6 +166,7 @@ public static class CatalogEndpoints
         try { await db.SaveChangesAsync(cancellationToken); }
         catch (DbUpdateException exception) when (IsUniqueViolation(exception)) { return Error(context, 409, "SKU_ALREADY_EXISTS", "Product SKU already exists"); }
         await transaction.CommitAsync(cancellationToken);
+        context.Target(product.Id);
         return Results.Created($"/api/v1/products/{product.Id}", await ProductResponseAsync(db, product, cancellationToken));
     }
 

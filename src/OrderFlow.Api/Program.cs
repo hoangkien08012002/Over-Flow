@@ -4,15 +4,18 @@ using System.Text.Json.Serialization;
 using System.Threading.RateLimiting;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.Data.SqlClient;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi;
+using OpenTelemetry.Metrics;
 using OrderFlow.Api;
 using OrderFlow.Application.Catalog;
 using OrderFlow.Application.Inventory;
+using OrderFlow.Infrastructure;
 using OrderFlow.Infrastructure.Caching;
 using OrderFlow.Infrastructure.Identity;
 using OrderFlow.Infrastructure.Messaging;
@@ -20,10 +23,16 @@ using OrderFlow.Infrastructure.Persistence;
 
 var builder = WebApplication.CreateBuilder(args);
 
+// Structured console output keeps the correlation scope on every line, so one order can be followed across the API and Worker logs.
+if (!builder.Environment.IsDevelopment()) builder.Logging.AddJsonConsole(options => options.IncludeScopes = true);
+
+// Only Development may fall back to a local database. Elsewhere a missing setting must stop startup rather than point at the wrong server.
 string GetConnectionString() => builder.Configuration.GetConnectionString("OrderFlow")
     ?? Environment.GetEnvironmentVariable("ORDERFLOW_SQL_CONNECTION")
-    ?? "Server=localhost;Database=OrderFlow;Integrated Security=true;TrustServerCertificate=true";
+    ?? (builder.Environment.IsDevelopment() ? "Server=localhost;Database=OrderFlow;Integrated Security=true;TrustServerCertificate=true"
+        : throw new InvalidOperationException("ConnectionStrings:OrderFlow or ORDERFLOW_SQL_CONNECTION is required."));
 builder.Services.AddDbContext<OrderFlowDbContext>(options => options.UseSqlServer(GetConnectionString()));
+builder.Services.AddOrderFlowTelemetry(builder.Configuration, "OrderFlow.Api", metrics => metrics.AddAspNetCoreInstrumentation());
 builder.Services.AddOptions<JwtOptions>().Bind(builder.Configuration.GetSection("Jwt"))
     .Validate(options => !string.IsNullOrWhiteSpace(options.Issuer) && !string.IsNullOrWhiteSpace(options.Audience) && Encoding.UTF8.GetByteCount(options.SigningKey) >= 32,
         "Jwt:Issuer, Jwt:Audience and a Jwt:SigningKey of at least 32 UTF-8 bytes are required.")
@@ -54,6 +63,35 @@ builder.Services.AddScoped<InventoryService>();
 builder.Services.AddScoped<IInventoryService>(sp => sp.GetRequiredService<InventoryService>());
 builder.Services.AddScoped<IReservationExpiryJob>(sp => sp.GetRequiredService<InventoryService>());
 builder.Services.AddScoped<CheckoutService>();
+builder.Services.AddScoped<ShippingService>();
+builder.Services.AddScoped<ReturnService>();
+builder.Services.AddOptions<ReturnOptions>().Bind(builder.Configuration.GetSection("Returns"))
+    .Validate(x => x.WindowDays is >= 1 and <= 365, "Returns:WindowDays must be 1 to 365.")
+    .ValidateOnStart();
+builder.Services.AddOptions<RateLimitOptions>().Bind(builder.Configuration.GetSection("RateLimits"))
+    .Validate(x => new[] { x.Register, x.Login, x.Refresh, x.Logout, x.Search, x.Checkout }.All(limit => limit >= 1), "Every rate limit must be positive.")
+    .ValidateOnStart();
+builder.Services.AddOptions<CorsSettings>().Bind(builder.Configuration.GetSection("Cors"))
+    .Validate(x => CorsPolicy.Valid(x, builder.Environment.IsDevelopment()), "Cors:AllowedOrigins must be exact origins without a wildcard, and HTTPS outside Development.")
+    .ValidateOnStart();
+builder.Services.AddOptions<ProxySettings>().Bind(builder.Configuration.GetSection("Proxy"))
+    .Validate(ProxyConfiguration.Valid, "Proxy:TrustedProxies must be IP addresses.")
+    .ValidateOnStart();
+builder.Services.AddOptions<KafkaOptions>().Bind(builder.Configuration.GetSection("Kafka"))
+    .Validate(x => !string.IsNullOrWhiteSpace(x.BootstrapServers), "Kafka:BootstrapServers is required.")
+    .ValidateOnStart();
+builder.Services.AddCors();
+builder.Services.AddOptions<Microsoft.AspNetCore.Cors.Infrastructure.CorsOptions>().Configure<Microsoft.Extensions.Options.IOptions<CorsSettings>>((options, settings) =>
+    options.AddPolicy(CorsPolicy.Name, policy => policy.WithOrigins(settings.Value.AllowedOrigins)
+        .WithMethods("GET", "POST", "PUT", "DELETE")
+        .WithHeaders("Authorization", "Content-Type", "Idempotency-Key", "X-Correlation-Id", RefreshCookie.TransportHeader)
+        .WithExposedHeaders("X-Correlation-Id", "Location", "Retry-After")
+        .AllowCredentials()));
+builder.Services.AddSingleton<KafkaHealthCheck>();
+builder.Services.AddHealthChecks()
+    .AddCheck<SqlHealthCheck>("sql")
+    .AddCheck<RedisHealthCheck>("redis")
+    .AddCheck<KafkaHealthCheck>("kafka");
 builder.Services.AddOptions<OrderingOptions>().Bind(builder.Configuration.GetSection("Ordering"))
     .Validate(x => x.IdempotencyRetentionHours is >= 1 and <= 720, "Idempotency retention must be 1 to 720 hours.")
     .ValidateOnStart();
@@ -110,11 +148,16 @@ builder.Services.AddAuthorization(options =>
     foreach (var role in new[] { "Customer", "Support", "InventoryManager", "Admin" })
         options.AddPolicy(role, policy => policy.RequireAuthenticatedUser().RequireRole(role));
     options.AddPolicy("OrderRead", policy => policy.RequireAuthenticatedUser().RequireRole("Customer", "Support", "Admin"));
+    options.AddPolicy("OrderStaff", policy => policy.RequireAuthenticatedUser().RequireRole("Support", "Admin"));
+    options.AddPolicy("Fulfillment", policy => policy.RequireAuthenticatedUser().RequireRole("InventoryManager", "Admin"));
+    options.AddPolicy("ReturnStaff", policy => policy.RequireAuthenticatedUser().RequireRole("Support", "InventoryManager", "Admin"));
     options.AddPolicy("OwnResource", policy => policy.RequireAuthenticatedUser().AddRequirements(new OwnResourceRequirement()));
 });
 builder.Services.AddRateLimiter(options =>
 {
-    foreach (var (name, limit) in new[] { ("register", 20), ("login", 20), ("refresh", 20), ("logout", 20) })
+    var limits = builder.Configuration.GetSection("RateLimits").Get<RateLimitOptions>() ?? new RateLimitOptions();
+    // Partitioned by client address, because the limiter runs before authentication and must also protect anonymous endpoints.
+    foreach (var (name, limit) in new[] { ("register", limits.Register), ("login", limits.Login), ("refresh", limits.Refresh), ("logout", limits.Logout), ("search", limits.Search), ("checkout", limits.Checkout) })
         options.AddPolicy(name, context => RateLimitPartition.GetFixedWindowLimiter(context.Connection.RemoteIpAddress?.ToString() ?? "unknown",
             _ => new FixedWindowRateLimiterOptions { PermitLimit = limit, Window = TimeSpan.FromMinutes(1), QueueLimit = 0, AutoReplenishment = true }));
     options.RejectionStatusCode = 429;
@@ -129,10 +172,21 @@ builder.Services.AddSwaggerGen(options =>
 });
 
 var app = builder.Build();
+var proxySettings = app.Services.GetRequiredService<Microsoft.Extensions.Options.IOptions<ProxySettings>>().Value;
+if (proxySettings.TrustedProxies.Length > 0)
+{
+    var forwarded = new ForwardedHeadersOptions();
+    ProxyConfiguration.Apply(forwarded, proxySettings);
+    app.UseForwardedHeaders(forwarded);
+}
 app.UseMiddleware<CorrelationIdMiddleware>();
 app.UseMiddleware<ProblemDetailsExceptionMiddleware>();
+app.UseMiddleware<RequestLoggingMiddleware>();
 app.UseMiddleware<UnhandledStatusProblemMiddleware>();
+app.UseMiddleware<SecurityHeadersMiddleware>();
 if (app.Environment.IsDevelopment()) { app.UseSwagger(); app.UseSwaggerUI(); }
+else app.UseHsts();
+app.UseCors(CorsPolicy.Name);
 app.UseRateLimiter();
 app.UseAuthentication();
 app.UseMiddleware<ActiveAccountMiddleware>();
@@ -150,19 +204,21 @@ app.MapPost("/api/v1/auth/register", async (RegisterRequest request, Authenticat
 app.MapPost("/api/v1/auth/login", async (LoginRequest request, AuthenticationService auth, HttpContext context) =>
 {
     if (string.IsNullOrWhiteSpace(request.Email) || string.IsNullOrEmpty(request.Password)) throw new AuthenticationException("AUTH_INVALID_CREDENTIALS", 401);
-    var tokens = await auth.LoginAsync(request.Email.Trim(), request.Password, context.Connection.RemoteIpAddress?.ToString(), context.RequestAborted);
-    return Results.Ok(tokens);
+    return TokenResult(context, await auth.LoginAsync(request.Email.Trim(), request.Password, context.Connection.RemoteIpAddress?.ToString(), context.RequestAborted));
 }).AllowAnonymous().RequireRateLimiting("login");
 
 app.MapPost("/api/v1/auth/refresh", async (RefreshRequest request, AuthenticationService auth, HttpContext context) =>
 {
-    if (string.IsNullOrWhiteSpace(request.RefreshToken)) throw new AuthenticationException("REFRESH_TOKEN_REVOKED", 401);
-    return Results.Ok(await auth.RefreshAsync(request.RefreshToken, context.Connection.RemoteIpAddress?.ToString(), context.RequestAborted));
+    var token = RefreshTokenFrom(context, request);
+    if (string.IsNullOrWhiteSpace(token)) throw new AuthenticationException("REFRESH_TOKEN_REVOKED", 401);
+    return TokenResult(context, await auth.RefreshAsync(token, context.Connection.RemoteIpAddress?.ToString(), context.RequestAborted));
 }).AllowAnonymous().RequireRateLimiting("refresh");
 
 app.MapPost("/api/v1/auth/logout", async (RefreshRequest request, AuthenticationService auth, HttpContext context) =>
 {
-    if (!string.IsNullOrWhiteSpace(request.RefreshToken)) await auth.LogoutAsync(request.RefreshToken, context.Connection.RemoteIpAddress?.ToString(), context.RequestAborted);
+    var token = RefreshTokenFrom(context, request);
+    if (!string.IsNullOrWhiteSpace(token)) await auth.LogoutAsync(token, context.Connection.RemoteIpAddress?.ToString(), context.RequestAborted);
+    if (RefreshCookie.Requested(context)) context.Response.Cookies.Delete(RefreshCookie.Name, RefreshCookie.Options(context, null));
     return Results.NoContent();
 }).AllowAnonymous().RequireRateLimiting("logout");
 
@@ -170,10 +226,25 @@ app.MapCatalogEndpoints();
 app.MapInventoryEndpoints();
 app.MapOrderingEndpoints();
 app.MapAdminEndpoints();
+app.MapFulfillmentEndpoints();
+app.MapEngagementEndpoints();
+app.MapHealthEndpoints();
 
 app.Run();
 
+static string? RefreshTokenFrom(HttpContext context, RefreshRequest request) =>
+    !string.IsNullOrWhiteSpace(request.RefreshToken) ? request.RefreshToken : RefreshCookie.Requested(context) ? context.Request.Cookies[RefreshCookie.Name] : null;
+
+// A browser client gets the refresh token only as an HttpOnly cookie. Other clients keep the documented JSON response.
+static IResult TokenResult(HttpContext context, AuthTokens tokens)
+{
+    if (!RefreshCookie.Requested(context)) return Results.Ok(tokens);
+    var days = context.RequestServices.GetRequiredService<Microsoft.Extensions.Options.IOptions<JwtOptions>>().Value.RefreshTokenDays;
+    context.Response.Cookies.Append(RefreshCookie.Name, tokens.RefreshToken, RefreshCookie.Options(context, tokens.AccessTokenExpiresAtUtc.AddDays(days)));
+    return Results.Ok(new { tokens.AccessToken, tokens.AccessTokenExpiresAtUtc });
+}
+
 public sealed record RegisterRequest(string Email, string Password, string FirstName, string LastName);
 public sealed record LoginRequest(string Email, string Password);
-public sealed record RefreshRequest(string RefreshToken);
+public sealed record RefreshRequest(string? RefreshToken);
 public partial class Program;

@@ -65,6 +65,16 @@ public sealed class Payment
         UpdatedAtUtc = now;
     }
 
+    // Delivery can be reported twice, and a return can reach Payment before the delivery event does, so a settled payment stays as it is.
+    public void MarkCollected(DateTimeOffset now)
+    {
+        if (SettlementStatus != SettlementStatus.PendingCollection) return;
+        SettlementStatus = SettlementStatus.Collected;
+        UpdatedAtUtc = now;
+    }
+
+    // An Admin sends a refund stuck in RefundFailed back for another attempt with the same idempotency key.
+    public void RetryRefund(DateTimeOffset now) { Require(PaymentStatus.RefundFailed); Status = PaymentStatus.RefundPending; UpdatedAtUtc = now; }
     public void BeginRefund(DateTimeOffset now) { Require(PaymentStatus.Succeeded); Status = PaymentStatus.RefundPending; UpdatedAtUtc = now; }
     public void CompleteRefund(DateTimeOffset now) { Require(PaymentStatus.RefundPending); Status = PaymentStatus.Refunded; UpdatedAtUtc = now; }
     public void FailRefund(DateTimeOffset now) { Require(PaymentStatus.RefundPending); Status = PaymentStatus.RefundFailed; UpdatedAtUtc = now; }
@@ -87,8 +97,38 @@ public sealed class Refund
     public string Reason { get; private set; } = null!;
     public string? ProviderReference { get; private set; }
     public string IdempotencyKey { get; private set; } = null!;
+    public int AttemptCount { get; private set; }
+    public DateTimeOffset? NextAttemptAtUtc { get; private set; }
+    public string CorrelationId { get; private set; } = "";
     public DateTimeOffset CreatedAtUtc { get; private set; }
     public DateTimeOffset UpdatedAtUtc { get; private set; }
+
+    public void SetCorrelation(string correlationId) => CorrelationId = correlationId;
+
+    public void RecordAttempt(DateTimeOffset now)
+    {
+        if (Status != RefundStatus.Pending) throw new InvalidOperationException("INVALID_STATE_TRANSITION");
+        AttemptCount++;
+        NextAttemptAtUtc = null;
+        UpdatedAtUtc = now;
+    }
+
+    public void ScheduleRetry(string providerReference, DateTimeOffset nextAttemptAtUtc, DateTimeOffset now)
+    {
+        if (Status != RefundStatus.Pending) throw new InvalidOperationException("INVALID_STATE_TRANSITION");
+        ProviderReference = providerReference;
+        NextAttemptAtUtc = nextAttemptAtUtc;
+        UpdatedAtUtc = now;
+    }
+
+    public void Reopen(DateTimeOffset now)
+    {
+        if (Status != RefundStatus.Failed) throw new InvalidOperationException("INVALID_STATE_TRANSITION");
+        Status = RefundStatus.Pending;
+        AttemptCount = 0;
+        NextAttemptAtUtc = now;
+        UpdatedAtUtc = now;
+    }
 
     public static Refund Create(Guid id, Payment payment, string idempotencyKey, string reason, DateTimeOffset now)
     {

@@ -19,6 +19,8 @@ public static class EventTypes
     public const string PaymentSucceeded = "PaymentSucceeded";
     public const string PaymentFailed = "PaymentFailed";
     public const string RefundCompleted = "RefundCompleted";
+    public const string RefundRequested = "RefundRequested";
+    public const string ShipmentStatusChanged = "ShipmentStatusChanged";
 }
 
 public static class EventTopics
@@ -36,7 +38,9 @@ public static class EventTopics
         [EventTypes.PaymentRequested] = "payment.requested",
         [EventTypes.PaymentSucceeded] = "payment.succeeded",
         [EventTypes.PaymentFailed] = "payment.failed",
-        [EventTypes.RefundCompleted] = "refund.completed"
+        [EventTypes.RefundCompleted] = "refund.completed",
+        [EventTypes.RefundRequested] = "refund.requested",
+        [EventTypes.ShipmentStatusChanged] = "shipment.status-changed"
     };
 
     public static IReadOnlyCollection<string> All => Topics.Values;
@@ -64,6 +68,15 @@ public sealed record PaymentResultPayload(Guid OrderId, Guid PaymentId, decimal 
     string ProviderReference, string ResultCode) : IOrderEventPayload;
 public sealed record RefundCompletedPayload(Guid OrderId, Guid PaymentId, Guid RefundId, decimal Amount, string CurrencyCode,
     string ProviderReference) : IOrderEventPayload;
+public sealed record RefundRequestedPayload(Guid OrderId, Guid ReturnRequestId, string ReasonCode) : IOrderEventPayload;
+// Status is Shipped, Delivered, or DeliveryFailed: the changes the customer and the order care about.
+public sealed record ShipmentStatusChangedPayload(Guid OrderId, Guid ShipmentId, string Status, string TrackingCode) : IOrderEventPayload;
+
+public static class CancellationReasons
+{
+    public const string CustomerRequest = "CUSTOMER_REQUEST";
+    public const string StaffRequest = "STAFF_REQUEST";
+}
 
 public static class ReleaseReasons
 {

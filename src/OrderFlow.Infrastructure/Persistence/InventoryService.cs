@@ -125,6 +125,8 @@ public sealed class InventoryService(OrderFlowDbContext db, TimeProvider clock, 
             var reservation = await db.InventoryReservations.SingleAsync(x => x.OrderId == orderId && x.ProductId == productId, cancellationToken);
             if (reservation.Status == ReservationStatus.Released) continue;
             if (reservation.Status == ReservationStatus.Expired) continue;
+            // Staff cancellation already returned this stock in its own transaction; OrderCancelled arrives afterwards.
+            if (reservation.Status == ReservationStatus.Committed && reservation.RestockedAtUtc is not null) continue;
             if (reservation.Status != ReservationStatus.Active)
                 throw new InvalidOperationException("Reservation cannot be released after commitment.");
             var now = clock.GetUtcNow();
@@ -136,6 +138,55 @@ public sealed class InventoryService(OrderFlowDbContext db, TimeProvider clock, 
             released++;
         }
         return released;
+    }
+
+    public async Task<int> CompensateStaffCancellationAsync(Guid orderId, Guid actorUserId, string correlationId, CancellationToken cancellationToken)
+    {
+        if (orderId == Guid.Empty || db.Database.CurrentTransaction is null)
+            throw new InvalidOperationException("Staff cancellation requires an active SQL transaction.");
+        var productIds = await db.InventoryReservations.AsNoTracking().Where(x => x.OrderId == orderId)
+            .OrderBy(x => x.ProductId).Select(x => x.ProductId).ToListAsync(cancellationToken);
+        var compensated = 0;
+        foreach (var productId in productIds)
+        {
+            // Holding the inventory lock serializes this with a commit in flight: the reservation is either still Active or already Committed here.
+            var inventory = await LockedInventoryAsync(productId, cancellationToken)
+                ?? throw new DbUpdateConcurrencyException("Inventory disappeared during cancellation.");
+            var reservation = await db.InventoryReservations.SingleAsync(x => x.OrderId == orderId && x.ProductId == productId, cancellationToken);
+            var now = clock.GetUtcNow();
+            if (reservation.Status == ReservationStatus.Active)
+            {
+                reservation.TransitionTo(ReservationStatus.Released, now);
+                await ApplyQuantitiesAsync(inventory.Id, reservation.Quantity, ReservationStatus.Released, now, cancellationToken);
+                compensated++;
+            }
+            else if (reservation.Status == ReservationStatus.Committed && reservation.MarkRestocked(now))
+            {
+                await ApplyAdjustmentAsync(inventory, reservation.Quantity, "ORDER_CANCELLED_RESTOCK", $"Order {orderId:N}", actorUserId, correlationId, now, cancellationToken);
+                compensated++;
+            }
+        }
+        return compensated;
+    }
+
+    public async Task RestockReturnAsync(Guid productId, int quantity, string note, Guid actorUserId, string correlationId, CancellationToken cancellationToken)
+    {
+        if (productId == Guid.Empty || quantity <= 0 || db.Database.CurrentTransaction is null)
+            throw new InvalidOperationException("Return restock requires a positive quantity and an active SQL transaction.");
+        var inventory = await LockedInventoryAsync(productId, cancellationToken)
+            ?? throw new DbUpdateConcurrencyException("Inventory disappeared during return receipt.");
+        await ApplyAdjustmentAsync(inventory, quantity, "RETURN_RESTOCK", note, actorUserId, correlationId, clock.GetUtcNow(), cancellationToken);
+    }
+
+    // OnHand changes only through an audited adjustment or a reservation commit (BR-003), so returned stock is recorded here too.
+    private async Task ApplyAdjustmentAsync(OrderFlow.Domain.Inventory.Inventory inventory, int quantity, string reasonCode, string note, Guid actorUserId, string correlationId, DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        var previousOnHand = inventory.OnHand;
+        var adjustment = inventory.Adjust(quantity, reasonCode, note, actorUserId, correlationId, now);
+        var changed = await db.Inventories.Where(x => x.Id == inventory.Id && x.OnHand == previousOnHand)
+            .ExecuteUpdateAsync(setters => setters.SetProperty(x => x.OnHand, inventory.OnHand).SetProperty(x => x.UpdatedAtUtc, now), cancellationToken);
+        if (changed != 1) throw new DbUpdateConcurrencyException("Inventory changed during adjustment.");
+        db.InventoryAdjustments.Add(adjustment);
     }
 
     public async Task<OrderReservationResult> ReserveOrderAsync(Guid orderId, IReadOnlyList<ReservationLine> lines, string correlationId, Guid? causationId, CancellationToken cancellationToken)
@@ -165,7 +216,11 @@ public sealed class InventoryService(OrderFlowDbContext db, TimeProvider clock, 
             var changed = await db.Inventories.Where(x => x.Id == inventory.Id && x.OnHand - x.Reserved >= line.Quantity)
                 .ExecuteUpdateAsync(setters => setters.SetProperty(x => x.Reserved, x => x.Reserved + line.Quantity)
                     .SetProperty(x => x.UpdatedAtUtc, now), cancellationToken);
-            if (changed != 1) throw new DbUpdateConcurrencyException("Inventory changed during reservation.");
+            if (changed != 1)
+            {
+                BusinessMetrics.InventoryConflicts.Add(1);
+                throw new DbUpdateConcurrencyException("Inventory changed during reservation.");
+            }
             var reservation = InventoryReservation.Create(Guid.NewGuid(), orderId, line.ProductId, line.Quantity, expiresAt, now);
             db.InventoryReservations.Add(reservation);
             reservations.Add(Snapshot(reservation));
@@ -248,7 +303,11 @@ public sealed class InventoryService(OrderFlowDbContext db, TimeProvider clock, 
             : await db.Inventories.Where(x => x.Id == inventoryId && x.Reserved >= quantity)
                 .ExecuteUpdateAsync(setters => setters.SetProperty(x => x.Reserved, x => x.Reserved - quantity)
                     .SetProperty(x => x.UpdatedAtUtc, now), cancellationToken);
-        if (changed != 1) throw new DbUpdateConcurrencyException("Inventory changed during transition.");
+        if (changed != 1)
+        {
+            BusinessMetrics.InventoryConflicts.Add(1);
+            throw new DbUpdateConcurrencyException("Inventory changed during transition.");
+        }
     }
 
     private void AddLowStockEvent(OrderFlow.Domain.Inventory.Inventory inventory, int before, int after, string correlationId, DateTimeOffset now, Guid? causationId = null)

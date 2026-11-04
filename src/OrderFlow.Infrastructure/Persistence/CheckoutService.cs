@@ -9,6 +9,7 @@ using Microsoft.Extensions.Options;
 using OrderFlow.Application.Inventory;
 using OrderFlow.Application.Messaging;
 using OrderFlow.Domain.Ordering;
+using OrderFlow.Domain.Shipping;
 
 namespace OrderFlow.Infrastructure.Persistence;
 
@@ -108,6 +109,7 @@ public sealed class CheckoutService(OrderFlowDbContext db, TimeProvider clock, I
                     order.Items.Select(x => new OrderCreatedItem(x.ProductId, x.Quantity, x.UnitPrice)).ToList()), now));
             await db.SaveChangesAsync(ct);
             await transaction.CommitAsync(ct);
+            BusinessMetrics.OrdersCreated.Add(1, new KeyValuePair<string, object?>("method", order.PaymentMethod));
             return new(202, null, body);
         }
         catch (Exception ex) when (FindSqlException(ex) is { Number: 2601 or 2627 or 1205 })
@@ -136,9 +138,36 @@ public sealed class CheckoutService(OrderFlowDbContext db, TimeProvider clock, I
         catch (DbUpdateConcurrencyException) { return new(409, "CONCURRENCY_CONFLICT", null); }
         await ReleaseCouponAsync(db, order, clock.GetUtcNow(), ct);
         db.OutboxMessages.Add(OutboxMessage.ForEvent(EventTypes.OrderCancelled, order.Id, correlationId, null,
-            new OrderCancelledPayload(order.Id, userId, "CUSTOMER_REQUEST"), clock.GetUtcNow()));
+            new OrderCancelledPayload(order.Id, userId, CancellationReasons.CustomerRequest), clock.GetUtcNow()));
         try { await db.SaveChangesAsync(ct); await transaction.CommitAsync(ct); }
         catch (DbUpdateConcurrencyException) { return new(409, "CONCURRENCY_CONFLICT", null); }
+        BusinessMetrics.OrdersCancelled.Add(1, new KeyValuePair<string, object?>("reason", CancellationReasons.CustomerRequest));
+        return new(200, null, JsonSerializer.Serialize(ToResponse(order), JsonOptions));
+    }
+
+    // Stock, shipment, and coupon are compensated in this transaction; the refund or void follows from OrderCancelled through the Payment consumer.
+    public async Task<CheckoutResult> CancelByStaffAsync(Guid actorId, Guid orderId, string? reason, string correlationId, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(reason) || reason.Trim().Length > 500) return new(400, "VALIDATION_FAILED", null);
+        await using var transaction = await db.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
+        var order = await db.Orders.FromSqlInterpolated($"SELECT * FROM dbo.Orders WITH (UPDLOCK, ROWLOCK) WHERE Id = {orderId}").SingleOrDefaultAsync(ct);
+        if (order is null) return new(404, "ORDER_NOT_FOUND", null);
+        if (order.Status == OrderStatus.Cancelled) return new(200, null, JsonSerializer.Serialize(ToResponse(order), JsonOptions));
+        // ShippingService holds this order lock while it moves a shipment, so this read cannot race a dispatch.
+        var shipment = await db.Shipments.Include(x => x.History).SingleOrDefaultAsync(x => x.OrderId == orderId, ct);
+        if (shipment?.Status is ShipmentStatus.Shipped or ShipmentStatus.Delivered or ShipmentStatus.DeliveryFailed) return new(409, "INVALID_STATE_TRANSITION", null);
+        var now = clock.GetUtcNow();
+        try { order.CancelByStaff(actorId, reason, now, correlationId); }
+        catch (InvalidOperationException) { return new(409, "INVALID_STATE_TRANSITION", null); }
+        shipment?.TransitionTo(ShipmentStatus.Cancelled, actorId, reason.Trim(), now, correlationId);
+        try { await inventoryService.CompensateStaffCancellationAsync(orderId, actorId, correlationId, ct); }
+        catch (DbUpdateConcurrencyException) { return new(409, "CONCURRENCY_CONFLICT", null); }
+        await ReleaseCouponAsync(db, order, now, ct);
+        db.OutboxMessages.Add(OutboxMessage.ForEvent(EventTypes.OrderCancelled, order.Id, correlationId, null,
+            new OrderCancelledPayload(order.Id, order.UserId, CancellationReasons.StaffRequest), now));
+        try { await db.SaveChangesAsync(ct); await transaction.CommitAsync(ct); }
+        catch (DbUpdateConcurrencyException) { return new(409, "CONCURRENCY_CONFLICT", null); }
+        BusinessMetrics.OrdersCancelled.Add(1, new KeyValuePair<string, object?>("reason", CancellationReasons.StaffRequest));
         return new(200, null, JsonSerializer.Serialize(ToResponse(order), JsonOptions));
     }
 
