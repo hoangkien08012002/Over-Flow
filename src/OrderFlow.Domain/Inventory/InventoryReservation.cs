@@ -16,7 +16,18 @@ public sealed class InventoryReservation
     public DateTimeOffset UpdatedAtUtc { get; private set; }
     public DateTimeOffset? CommittedAtUtc { get; private set; }
     public DateTimeOffset? ReleasedAtUtc { get; private set; }
+    public DateTimeOffset? RestockedAtUtc { get; private set; }
     public byte[] RowVersion { get; private set; } = [];
+
+    // Committed stays terminal. This records that staff cancellation put the committed stock back, so it cannot happen twice.
+    public bool MarkRestocked(DateTimeOffset now)
+    {
+        if (Status != ReservationStatus.Committed) throw new InvalidOperationException("Only committed stock can be restocked.");
+        if (RestockedAtUtc is not null) return false;
+        RestockedAtUtc = now;
+        UpdatedAtUtc = now;
+        return true;
+    }
 
     public static InventoryReservation Create(Guid id, Guid orderId, Guid productId, int quantity, DateTimeOffset expiresAtUtc, DateTimeOffset now)
     {

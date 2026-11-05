@@ -19,7 +19,7 @@ public static class OrderingEndpoints
         cart.MapPut("/items/{id:guid}", UpdateItem);
         cart.MapDelete("/items/{id:guid}", DeleteItem);
         var orders = app.MapGroup("/api/v1/orders").RequireAuthorization("Customer");
-        orders.MapPost("", Checkout);
+        orders.MapPost("", Checkout).RequireRateLimiting("checkout");
         orders.MapGet("", ListOrders);
         orders.MapGet("/{id:guid}", GetOrder);
         orders.MapPost("/{id:guid}/cancel", CancelOrder);
@@ -135,12 +135,14 @@ public static class OrderingEndpoints
     {
         var order = await db.Orders.AsNoTracking().Include(x => x.Items).Include(x => x.History)
             .SingleOrDefaultAsync(x => x.Id == id && x.UserId == UserId(context), ct);
-        return order is null ? Error(context, 404, "ORDER_NOT_FOUND") : Results.Ok(new
-        { order = CheckoutService.ToResponse(order),
-            items = order.Items.OrderBy(x => x.ProductId).Select(x => new OrderItemResponse(x.ProductId, x.SkuSnapshot, x.ProductNameSnapshot, x.UnitPrice, x.Quantity, x.LineSubtotal, x.DiscountAmount)),
-            history = order.History.OrderBy(x => x.ChangedAtUtc).Select(x => new OrderHistoryResponse(x.FromStatus, x.ToStatus, x.ChangedAtUtc, x.ActorUserId, x.EventId, x.Reason, x.CorrelationId)),
-            deliveryAddress = CheckoutService.ReadAddress(order), order.PaymentMethod, order.ShippingMethodName });
+        return order is null ? Error(context, 404, "ORDER_NOT_FOUND") : Results.Ok(ToDetail(order));
     }
+
+    internal static object ToDetail(Order order) => new
+    { order = CheckoutService.ToResponse(order),
+        items = order.Items.OrderBy(x => x.ProductId).Select(x => new OrderItemResponse(x.Id, x.ProductId, x.SkuSnapshot, x.ProductNameSnapshot, x.UnitPrice, x.Quantity, x.LineSubtotal, x.DiscountAmount)),
+        history = order.History.OrderBy(x => x.ChangedAtUtc).Select(x => new OrderHistoryResponse(x.FromStatus, x.ToStatus, x.ChangedAtUtc, x.ActorUserId, x.EventId, x.Reason, x.CorrelationId)),
+        deliveryAddress = CheckoutService.ReadAddress(order), order.PaymentMethod, order.ShippingMethodName };
 
     private static async Task<IResult> CancelOrder(Guid id, CancelOrderRequest request, CheckoutService service, HttpContext context, CancellationToken ct) =>
         Result(context, await service.CancelAsync(UserId(context), id, request.Reason, Correlation(context), ct));
@@ -149,5 +151,5 @@ public static class OrderingEndpoints
 public sealed record CartItemRequest(Guid ProductId, int Quantity);
 public sealed record CartQuantityRequest(int Quantity);
 public sealed record CancelOrderRequest(string? Reason);
-public sealed record OrderItemResponse(Guid ProductId, string SkuSnapshot, string ProductNameSnapshot, decimal UnitPrice, int Quantity, decimal LineSubtotal, decimal DiscountAmount);
+public sealed record OrderItemResponse(Guid Id, Guid ProductId, string SkuSnapshot, string ProductNameSnapshot, decimal UnitPrice, int Quantity, decimal LineSubtotal, decimal DiscountAmount);
 public sealed record OrderHistoryResponse(OrderStatus? FromStatus, OrderStatus ToStatus, DateTimeOffset ChangedAtUtc, Guid? ActorUserId, Guid? EventId, string? Reason, string CorrelationId);

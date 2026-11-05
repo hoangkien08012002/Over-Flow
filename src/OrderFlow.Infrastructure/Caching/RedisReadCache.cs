@@ -66,6 +66,17 @@ public sealed class RedisReadCache : IReadCache, IAsyncDisposable
         duration = meter.CreateHistogram<double>("orderflow.cache.operation.duration", "ms");
     }
 
+    public async Task<bool> PingAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            var multiplexer = await connection.Value.WaitAsync(TimeSpan.FromSeconds(2), cancellationToken);
+            await multiplexer.GetDatabase().PingAsync().WaitAsync(TimeSpan.FromSeconds(2), cancellationToken);
+            return true;
+        }
+        catch (Exception exception) when (exception is RedisException or TimeoutException) { return false; }
+    }
+
     public async Task<T?> GetOrLoadAsync<T>(CacheEntryPolicy policy, string key, Func<CancellationToken, Task<T?>> load, CancellationToken cancellationToken) where T : class
     {
         // This instance knows the stored value is stale until the retry loop removes it.

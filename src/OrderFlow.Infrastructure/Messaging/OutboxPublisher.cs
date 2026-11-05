@@ -112,8 +112,8 @@ public sealed class OutboxPublisher(OrderFlowDbContext db, IEventProducer produc
             .SetProperty(x => x.NextAttemptAtUtc, nextAttempt).SetProperty(x => x.LastError, safeError)
             .SetProperty(x => x.LockId, (Guid?)null).SetProperty(x => x.LockedUntilUtc, (DateTimeOffset?)null), cancellationToken);
         metrics.PublishFailures.Add(1);
-        logger.LogWarning("Publishing {EventType} {EventId} failed on attempt {Attempt}; next attempt at {NextAttemptAtUtc}: {Error}",
-            row.EventType, row.Id, row.AttemptCount, nextAttempt, safeError);
+        logger.LogWarning("Publishing {EventType} {EventId} failed on attempt {Attempt}; next attempt at {NextAttemptAtUtc} (correlation {CorrelationId}): {Error}",
+            row.EventType, row.Id, row.AttemptCount, nextAttempt, row.CorrelationId, safeError);
     }
 
     private async Task ParkAsync(OutboxMessage row, Guid lockId, string error, CancellationToken cancellationToken)

@@ -1,11 +1,15 @@
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Identity.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore;
+using OrderFlow.Domain.Administration;
 using OrderFlow.Domain.Catalog;
+using OrderFlow.Domain.Engagement;
 using OrderFlow.Domain.Inventory;
 using OrderFlow.Domain.Notifications;
 using OrderFlow.Domain.Ordering;
 using OrderFlow.Domain.Payments;
+using OrderFlow.Domain.Returns;
+using OrderFlow.Domain.Shipping;
 using OrderFlow.Infrastructure.Identity;
 
 namespace OrderFlow.Infrastructure.Persistence;
@@ -34,6 +38,14 @@ public sealed class OrderFlowDbContext(DbContextOptions<OrderFlowDbContext> opti
     public DbSet<Payment> Payments => Set<Payment>();
     public DbSet<Refund> Refunds => Set<Refund>();
     public DbSet<Notification> Notifications => Set<Notification>();
+    public DbSet<Shipment> Shipments => Set<Shipment>();
+    public DbSet<ShipmentStatusHistory> ShipmentStatusHistories => Set<ShipmentStatusHistory>();
+    public DbSet<ReturnRequest> ReturnRequests => Set<ReturnRequest>();
+    public DbSet<ReturnItem> ReturnItems => Set<ReturnItem>();
+    public DbSet<ReturnStatusHistory> ReturnStatusHistories => Set<ReturnStatusHistory>();
+    public DbSet<WishlistItem> WishlistItems => Set<WishlistItem>();
+    public DbSet<Review> Reviews => Set<Review>();
+    public DbSet<AuditEntry> AuditEntries => Set<AuditEntry>();
 
     protected override void OnModelCreating(ModelBuilder builder)
     {

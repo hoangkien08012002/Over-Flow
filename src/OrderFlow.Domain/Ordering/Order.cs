@@ -53,6 +53,15 @@ public sealed class Order
         Transition(OrderStatus.Cancelled, now, correlationId, actorId, null, reason);
     }
 
+    // A repeat on an already cancelled order is a no-op; the caller decides compensation from what the order holds now.
+    public void CancelByStaff(Guid actorId, string reason, DateTimeOffset now, string correlationId)
+    {
+        if (Status == OrderStatus.Cancelled) return;
+        if (Status is not (OrderStatus.Paid or OrderStatus.Processing) || string.IsNullOrWhiteSpace(reason))
+            throw new InvalidOperationException("INVALID_STATE_TRANSITION");
+        Transition(OrderStatus.Cancelled, now, correlationId, actorId, null, reason.Trim());
+    }
+
     public void Transition(OrderStatus next, DateTimeOffset now, string correlationId, Guid? actorId = null, Guid? eventId = null, string? reason = null)
     {
         if (now.Offset != TimeSpan.Zero || string.IsNullOrWhiteSpace(correlationId) || reason?.Length > 500)
@@ -61,10 +70,11 @@ public sealed class Order
         {
             (OrderStatus.PendingInventory, OrderStatus.AwaitingPayment or OrderStatus.Rejected or OrderStatus.Cancelled) => true,
             (OrderStatus.AwaitingPayment, OrderStatus.Paid or OrderStatus.PaymentFailed or OrderStatus.Cancelled) => true,
-            // Customers cannot reach this edge: Cancel() stops at AwaitingPayment. It is the compensation path after paying for an expired reservation.
+            // Customers cannot reach these cancellations: Cancel() stops at AwaitingPayment. They are staff cancellation and the compensation after paying for an expired reservation.
             (OrderStatus.Paid, OrderStatus.Processing or OrderStatus.Cancelled) => true,
-            (OrderStatus.Processing, OrderStatus.Shipped) => true,
+            (OrderStatus.Processing, OrderStatus.Shipped or OrderStatus.Cancelled) => true,
             (OrderStatus.Shipped, OrderStatus.Delivered) => true,
+            (OrderStatus.Delivered, OrderStatus.Refunded) => true,
             _ => false
         };
         if (!allowed) throw new InvalidOperationException("INVALID_STATE_TRANSITION");

@@ -5,6 +5,8 @@ using OrderFlow.Application.Messaging;
 using OrderFlow.Application.Notifications;
 using OrderFlow.Domain.Notifications;
 using OrderFlow.Domain.Ordering;
+using OrderFlow.Domain.Returns;
+using OrderFlow.Domain.Shipping;
 using OrderFlow.Infrastructure.Persistence;
 
 namespace OrderFlow.Infrastructure.Messaging;
@@ -34,6 +36,7 @@ public sealed class InventoryEventHandler(OrderFlowDbContext db, IInventoryServi
         if (request.Items is null || request.Items.Count == 0) throw new EventContractException("OrderCreated has no items.");
         var result = await inventory.ReserveOrderAsync(order.Id, request.Items.Select(x => new ReservationLine(x.ProductId, x.Quantity)).ToList(), envelope.CorrelationId, envelope.EventId, cancellationToken);
         var now = clock.GetUtcNow();
+        if (result.Rejected.Count > 0) BusinessMetrics.InventoryRejections.Add(1);
         if (result.Rejected.Count > 0)
             db.OutboxMessages.Add(OutboxMessage.ForEvent(EventTypes.InventoryRejected, order.Id, envelope.CorrelationId, envelope.EventId,
                 new InventoryRejectedPayload(order.Id, result.Rejected.Select(x => new RejectedItem(x.ProductId, x.RequestedQuantity, x.AvailableQuantity, x.ReasonCode)).ToList()), now));
@@ -75,8 +78,39 @@ public sealed class OrderingEventHandler(OrderFlowDbContext db, TimeProvider clo
         EventTypes.PaymentFailed => OnPaymentFailedAsync(envelope, cancellationToken),
         EventTypes.InventoryCommitted => OnCommittedAsync(envelope, cancellationToken),
         EventTypes.InventoryReleased => OnReleasedAsync(envelope, cancellationToken),
+        EventTypes.ShipmentStatusChanged => OnShipmentChangedAsync(envelope, cancellationToken),
+        EventTypes.RefundCompleted => OnRefundCompletedAsync(envelope, cancellationToken),
         _ => throw new EventContractException($"Ordering does not handle {envelope.EventType}.")
     };
+
+    private async Task OnShipmentChangedAsync(EventEnvelope envelope, CancellationToken cancellationToken)
+    {
+        var shipment = EventSerializer.ReadPayload<ShipmentStatusChangedPayload>(envelope);
+        var order = await LockOrderAsync(shipment.OrderId, cancellationToken);
+        var now = clock.GetUtcNow();
+        switch (shipment.Status)
+        {
+            case nameof(ShipmentStatus.Shipped) when order.Status == OrderStatus.Processing:
+                order.Transition(OrderStatus.Shipped, now, envelope.CorrelationId, eventId: envelope.EventId);
+                break;
+            case nameof(ShipmentStatus.Delivered) when order.Status is OrderStatus.Processing or OrderStatus.Shipped:
+                // A replayed dispatch event can arrive after delivery. Delivery proves the dispatch, so it may advance through Shipped.
+                if (order.Status == OrderStatus.Processing) order.Transition(OrderStatus.Shipped, now, envelope.CorrelationId, eventId: envelope.EventId, reason: "DELIVERY_REPORTED_FIRST");
+                order.Transition(OrderStatus.Delivered, now, envelope.CorrelationId, eventId: envelope.EventId);
+                break;
+            default:
+                LogIgnored(envelope, order);
+                break;
+        }
+    }
+
+    private async Task OnRefundCompletedAsync(EventEnvelope envelope, CancellationToken cancellationToken)
+    {
+        var order = await LockOrderAsync(EventSerializer.ReadPayload<RefundCompletedPayload>(envelope).OrderId, cancellationToken);
+        // A cancelled order stays Cancelled after its refund. Only a delivered order can be refunded by a return.
+        if (order.Status != OrderStatus.Delivered) { LogIgnored(envelope, order); return; }
+        order.Transition(OrderStatus.Refunded, clock.GetUtcNow(), envelope.CorrelationId, eventId: envelope.EventId, reason: "RETURN_REFUNDED");
+    }
 
     private async Task OnReservedAsync(EventEnvelope envelope, CancellationToken cancellationToken)
     {
@@ -134,6 +168,7 @@ public sealed class OrderingEventHandler(OrderFlowDbContext db, TimeProvider clo
         if (order.Status is not (OrderStatus.PendingInventory or OrderStatus.AwaitingPayment or OrderStatus.Paid)) { LogIgnored(envelope, order); return; }
         var now = clock.GetUtcNow();
         order.Transition(OrderStatus.Cancelled, now, envelope.CorrelationId, eventId: envelope.EventId, reason: ReleaseReasons.ReservationExpired);
+        BusinessMetrics.OrdersCancelled.Add(1, new KeyValuePair<string, object?>("reason", ReleaseReasons.ReservationExpired));
         await CheckoutService.ReleaseCouponAsync(db, order, now, cancellationToken);
         db.OutboxMessages.Add(OutboxMessage.ForEvent(EventTypes.OrderCancelled, order.Id, envelope.CorrelationId, envelope.EventId,
             new OrderCancelledPayload(order.Id, order.UserId, ReleaseReasons.ReservationExpired), now));
@@ -153,13 +188,36 @@ public sealed class PaymentEventHandler(PaymentService payments) : IEventHandler
     {
         EventTypes.PaymentRequested => payments.ProcessRequestAsync(envelope, EventSerializer.ReadPayload<PaymentRequestedPayload>(envelope), cancellationToken),
         EventTypes.OrderCancelled => RefundAsync(envelope, cancellationToken),
+        EventTypes.RefundRequested => payments.RefundForReturnAsync(EventSerializer.ReadPayload<RefundRequestedPayload>(envelope), envelope.CorrelationId, envelope.EventId, cancellationToken),
+        EventTypes.ShipmentStatusChanged => OnShipmentChangedAsync(envelope, cancellationToken),
         _ => throw new EventContractException($"Payment does not handle {envelope.EventType}.")
     };
+
+    private async Task OnShipmentChangedAsync(EventEnvelope envelope, CancellationToken cancellationToken)
+    {
+        var shipment = EventSerializer.ReadPayload<ShipmentStatusChangedPayload>(envelope);
+        if (shipment.Status == nameof(ShipmentStatus.Delivered)) await payments.MarkCollectedAsync(shipment.OrderId, cancellationToken);
+    }
 
     private async Task RefundAsync(EventEnvelope envelope, CancellationToken cancellationToken)
     {
         var cancelled = EventSerializer.ReadPayload<OrderCancelledPayload>(envelope);
         await payments.RefundForOrderAsync(cancelled.OrderId, $"order-cancelled:{cancelled.OrderId:N}", cancelled.ReasonCode, envelope.CorrelationId, envelope.EventId, cancellationToken);
+    }
+}
+
+public sealed class ReturnEventHandler(OrderFlowDbContext db, TimeProvider clock, ILogger<ReturnEventHandler> logger) : IEventHandler
+{
+    public async Task HandleAsync(EventEnvelope envelope, CancellationToken cancellationToken)
+    {
+        var refund = EventSerializer.ReadPayload<RefundCompletedPayload>(envelope);
+        var request = await db.ReturnRequests.Include(x => x.History).SingleOrDefaultAsync(x => x.OrderId == refund.OrderId && x.Status == ReturnStatus.Received, cancellationToken);
+        if (request is null)
+        {
+            logger.LogInformation("RefundCompleted {EventId} for order {OrderId} has no received return", envelope.EventId, refund.OrderId);
+            return;
+        }
+        request.TransitionTo(ReturnStatus.Refunded, null, envelope.EventId, null, clock.GetUtcNow(), envelope.CorrelationId);
     }
 }
 
@@ -191,8 +249,17 @@ public sealed class NotificationEventHandler(OrderFlowDbContext db, INotificatio
         EventTypes.OrderCancelled => (EventSerializer.ReadPayload<OrderCancelledPayload>(envelope).OrderId, x => $"Order {x} was cancelled."),
         EventTypes.RefundCompleted => (EventSerializer.ReadPayload<RefundCompletedPayload>(envelope).OrderId, x => $"The refund for order {x} is complete."),
         EventTypes.InventoryLow => ((Guid?)null, x => $"Product {x} is low on stock."),
+        EventTypes.ShipmentStatusChanged => DescribeShipment(EventSerializer.ReadPayload<ShipmentStatusChangedPayload>(envelope)),
         _ => throw new EventContractException($"Notifications does not handle {envelope.EventType}.")
     };
+
+    private static (Guid? OrderId, Func<string, string> Describe) DescribeShipment(ShipmentStatusChangedPayload shipment) => (shipment.OrderId, shipment.Status switch
+    {
+        nameof(ShipmentStatus.Shipped) => x => $"Order {x} has shipped. Tracking code: {shipment.TrackingCode}.",
+        nameof(ShipmentStatus.Delivered) => x => $"Order {x} was delivered.",
+        nameof(ShipmentStatus.DeliveryFailed) => x => $"Delivery of order {x} failed. Our team will contact you.",
+        _ => throw new EventContractException("ShipmentStatusChanged has an unsupported status.")
+    });
 }
 
 public sealed class LogNotificationProvider(ILogger<LogNotificationProvider> logger) : INotificationProvider

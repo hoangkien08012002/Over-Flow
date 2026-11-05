@@ -1,5 +1,7 @@
 using System.Data;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using OrderFlow.Application.Messaging;
 using OrderFlow.Application.Payments;
 using OrderFlow.Domain.Ordering;
@@ -7,7 +9,16 @@ using OrderFlow.Domain.Payments;
 
 namespace OrderFlow.Infrastructure.Persistence;
 
-public sealed class PaymentService(OrderFlowDbContext db, PaymentStrategyFactory strategies, TimeProvider clock)
+public sealed class RefundOptions
+{
+    // Attempts made before a failed refund goes to the Admin queue (D-23).
+    public int MaxAttempts { get; set; } = 3;
+    public int RetryDelaySeconds { get; set; } = 30;
+    public int PollSeconds { get; set; } = 5;
+    public int BatchSize { get; set; } = 50;
+}
+
+public sealed class PaymentService(OrderFlowDbContext db, PaymentStrategyFactory strategies, TimeProvider clock, IOptions<RefundOptions> refundOptions, ILogger<PaymentService> logger)
 {
     // Runs inside the consumer transaction. The simulated providers are local and deterministic, so the call rolls back with the Inbox record.
     public async Task ProcessRequestAsync(EventEnvelope source, PaymentRequestedPayload request, CancellationToken ct)
@@ -26,6 +37,7 @@ public sealed class PaymentService(OrderFlowDbContext db, PaymentStrategyFactory
         db.Payments.Add(payment);
         db.OutboxMessages.Add(OutboxMessage.ForEvent(result.Accepted ? EventTypes.PaymentSucceeded : EventTypes.PaymentFailed, order.Id, source.CorrelationId, source.EventId,
             new PaymentResultPayload(order.Id, payment.Id, payment.Amount, payment.CurrencyCode, payment.Method, result.ProviderReference, result.ResultCode), now));
+        BusinessMetrics.PaymentOutcomes.Add(1, new KeyValuePair<string, object?>("outcome", result.Accepted ? "succeeded" : "failed"), new KeyValuePair<string, object?>("method", payment.Method));
     }
 
     // Safe to repeat: one payment has one refund, so a repeated command or event returns the existing refund.
@@ -41,9 +53,52 @@ public sealed class PaymentService(OrderFlowDbContext db, PaymentStrategyFactory
         return refund;
     }
 
+    // Runs inside the consumer transaction. Delivery is what collects COD, and a return exists only after delivery, so collection is recorded first
+    // even when the delivery event has not reached this consumer yet. Otherwise the refund would void a collection that really happened.
+    public async Task<Refund?> RefundForReturnAsync(RefundRequestedPayload request, string correlationId, Guid causationId, CancellationToken ct)
+    {
+        var payment = await LockPaymentAsync(request.OrderId, ct);
+        payment?.MarkCollected(clock.GetUtcNow());
+        return await RefundForOrderAsync(request.OrderId, $"return:{request.ReturnRequestId:N}", request.ReasonCode, correlationId, causationId, ct);
+    }
+
+    public async Task MarkCollectedAsync(Guid orderId, CancellationToken ct)
+    {
+        var payment = await LockPaymentAsync(orderId, ct);
+        payment?.MarkCollected(clock.GetUtcNow());
+    }
+
+    // One refund per transaction, so a failure leaves the rest of the batch unaffected. The payment row lock keeps two Workers from attempting the same refund.
+    public async Task<int> RetryDueRefundsAsync(CancellationToken ct)
+    {
+        var options = refundOptions.Value;
+        var now = clock.GetUtcNow();
+        var due = await db.Refunds.AsNoTracking().Where(x => x.Status == RefundStatus.Pending && x.NextAttemptAtUtc != null && x.NextAttemptAtUtc <= now)
+            .OrderBy(x => x.NextAttemptAtUtc).Take(options.BatchSize).Select(x => new { x.Id, x.OrderId }).ToListAsync(ct);
+        var attempted = 0;
+        foreach (var item in due)
+        {
+            db.ChangeTracker.Clear();
+            await using var transaction = await db.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
+            var payment = await LockPaymentAsync(item.OrderId, ct);
+            var refund = await db.Refunds.SingleOrDefaultAsync(x => x.Id == item.Id, ct);
+            if (payment is null || refund is null || refund.Status != RefundStatus.Pending || refund.NextAttemptAtUtc is null || refund.NextAttemptAtUtc > clock.GetUtcNow()) continue;
+            var strategy = strategies.Find(payment.Method) ?? throw new InvalidOperationException("Payment has an unsupported method.");
+            // A refund created before this column existed has no correlation ID, and an event needs one, so it falls back as expiry events do.
+            await AttemptAsync(payment, refund, strategy, string.IsNullOrEmpty(refund.CorrelationId) ? item.OrderId.ToString("N") : refund.CorrelationId, null, ct);
+            await db.SaveChangesAsync(ct);
+            await transaction.CommitAsync(ct);
+            attempted++;
+        }
+        return attempted;
+    }
+
+    private Task<Payment?> LockPaymentAsync(Guid orderId, CancellationToken ct) =>
+        db.Payments.FromSqlInterpolated($"SELECT * FROM dbo.Payments WITH (UPDLOCK, ROWLOCK) WHERE OrderId = {orderId}").SingleOrDefaultAsync(ct);
+
     private async Task<Refund?> RefundCoreAsync(Guid orderId, string idempotencyKey, string reason, string correlationId, Guid? causationId, CancellationToken ct)
     {
-        var payment = await db.Payments.FromSqlInterpolated($"SELECT * FROM dbo.Payments WITH (UPDLOCK, ROWLOCK) WHERE OrderId = {orderId}").SingleOrDefaultAsync(ct);
+        var payment = await LockPaymentAsync(orderId, ct);
         if (payment is null) return null;
         var existing = await db.Refunds.SingleOrDefaultAsync(x => x.PaymentId == payment.Id, ct);
         if (existing is not null || payment.Status != PaymentStatus.Succeeded) return existing;
@@ -57,18 +112,38 @@ public sealed class PaymentService(OrderFlowDbContext db, PaymentStrategyFactory
         var strategy = strategies.Find(payment.Method) ?? throw new InvalidOperationException("Payment has an unsupported method.");
         payment.BeginRefund(now);
         var refund = Refund.Create(Guid.NewGuid(), payment, idempotencyKey, reason, now);
+        refund.SetCorrelation(correlationId);
         db.Refunds.Add(refund);
-        var result = await strategy.RefundAsync(refund.Id, new PaymentAttempt(payment.Id, orderId, payment.Amount, payment.CurrencyCode), ct);
-        if (!result.Accepted)
-        {
-            refund.Fail(result.ProviderReference, now);
-            payment.FailRefund(now);
-            return refund;
-        }
-        refund.Complete(result.ProviderReference, now);
-        payment.CompleteRefund(now);
-        db.OutboxMessages.Add(OutboxMessage.ForEvent(EventTypes.RefundCompleted, orderId, correlationId, causationId,
-            new RefundCompletedPayload(orderId, payment.Id, refund.Id, refund.Amount, refund.CurrencyCode, result.ProviderReference), now));
+        await AttemptAsync(payment, refund, strategy, correlationId, causationId, ct);
         return refund;
+    }
+
+    // Every attempt reuses the refund's identity, so a provider that already applied it can answer without paying twice.
+    private async Task AttemptAsync(Payment payment, Refund refund, IPaymentStrategy strategy, string correlationId, Guid? causationId, CancellationToken ct)
+    {
+        var now = clock.GetUtcNow();
+        refund.RecordAttempt(now);
+        var result = await strategy.RefundAsync(refund.Id, new PaymentAttempt(payment.Id, payment.OrderId, payment.Amount, payment.CurrencyCode), ct);
+        if (result.Accepted)
+        {
+            refund.Complete(result.ProviderReference, now);
+            payment.CompleteRefund(now);
+            db.OutboxMessages.Add(OutboxMessage.ForEvent(EventTypes.RefundCompleted, payment.OrderId, correlationId, causationId,
+                new RefundCompletedPayload(payment.OrderId, payment.Id, refund.Id, refund.Amount, refund.CurrencyCode, result.ProviderReference), now));
+            return;
+        }
+        BusinessMetrics.RefundAttemptsFailed.Add(1);
+        var options = refundOptions.Value;
+        if (refund.AttemptCount < options.MaxAttempts)
+        {
+            refund.ScheduleRetry(result.ProviderReference, now.AddSeconds(options.RetryDelaySeconds), now);
+            logger.LogWarning("Refund {RefundId} for order {OrderId} failed attempt {Attempt} of {MaxAttempts} and will retry", refund.Id, payment.OrderId, refund.AttemptCount, options.MaxAttempts);
+            return;
+        }
+        refund.Fail(result.ProviderReference, now);
+        payment.FailRefund(now);
+        BusinessMetrics.RefundsQueuedForAdmin.Add(1);
+        // This error log and the metric above are the alert; the Admin queue lists the refund until someone acts.
+        logger.LogError("Refund {RefundId} for order {OrderId} failed after {Attempts} attempts and needs an Admin", refund.Id, payment.OrderId, refund.AttemptCount);
     }
 }

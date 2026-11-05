@@ -16,6 +16,8 @@ public sealed class PaymentSimulationOptions
 {
     // An amount ending in these cents is declined, which makes a failed payment reproducible without a client-supplied switch.
     public int DeclineCents { get; set; } = 13;
+    // A refund of an amount ending in these cents fails, which exercises the retry and Admin queue path. Off by default.
+    public int? RefundFailCents { get; set; }
 }
 
 public sealed class CodPaymentStrategy : IPaymentStrategy
@@ -40,7 +42,9 @@ public abstract class SimulatedPaymentStrategy(PaymentSimulationOptions options,
             : new ProviderResult(true, $"{prefix}-{attempt.PaymentId:N}", "APPROVED"));
 
     public Task<ProviderResult> RefundAsync(Guid refundId, PaymentAttempt attempt, CancellationToken cancellationToken) =>
-        Task.FromResult(new ProviderResult(true, $"{prefix}-REFUND-{refundId:N}", "REFUNDED"));
+        Task.FromResult(decimal.Truncate(attempt.Amount % 1 * 100) == options.RefundFailCents
+            ? new ProviderResult(false, $"{prefix}-REFUND-{refundId:N}", "REFUND_REJECTED")
+            : new ProviderResult(true, $"{prefix}-REFUND-{refundId:N}", "REFUNDED"));
 }
 
 public sealed class BankTransferSimulationStrategy(PaymentSimulationOptions options) : SimulatedPaymentStrategy(options, "BANK", "BANK_TRANSFER_REJECTED")
