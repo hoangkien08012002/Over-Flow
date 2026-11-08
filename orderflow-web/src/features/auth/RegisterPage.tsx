@@ -5,7 +5,7 @@ import { useForm } from 'react-hook-form';
 import { Link as RouterLink, useNavigate } from 'react-router-dom';
 import { z } from 'zod';
 import { login, register as registerAccount } from '../../api/client';
-import { toApiError, type ApiError } from '../../api/errors';
+import { mapFieldErrors, toApiError, type ApiError } from '../../api/errors';
 import { ErrorState } from '../../components/PageStates';
 
 const schema = z.object({
@@ -24,7 +24,7 @@ type Values = z.infer<typeof schema>;
 export function RegisterPage() {
   const navigate = useNavigate();
   const [failure, setFailure] = useState<ApiError | null>(null);
-  const { register, handleSubmit, formState: { errors, isSubmitting } } = useForm<Values>({ resolver: zodResolver(schema) });
+  const { register, handleSubmit, setError, formState: { errors, isSubmitting } } = useForm<Values>({ resolver: zodResolver(schema) });
 
   const submit = async (values: Values) => {
     setFailure(null);
@@ -33,7 +33,10 @@ export function RegisterPage() {
       await login(values.email, values.password);
       navigate('/', { replace: true });
     } catch (error) {
-      setFailure(toApiError(error));
+      const problem = toApiError(error);
+      const { mapped, showGlobal } = mapFieldErrors(problem, ['firstName', 'lastName', 'email', 'password']);
+      Object.entries(mapped).forEach(([field, message]) => setError(field as keyof Values, { message }));
+      if (showGlobal) setFailure(problem);
     }
   };
 

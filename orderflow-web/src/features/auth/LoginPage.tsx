@@ -16,7 +16,8 @@ const schema = z.object({
 type Values = z.infer<typeof schema>;
 
 // Only a path inside this app is followed, so a crafted link cannot send the user elsewhere after sign-in.
-export const safeReturnPath = (from: unknown) => (typeof from === 'string' && from.startsWith('/') && !from.startsWith('//') ? from : '/');
+// Browsers read a backslash as a slash, so /\evil.example would leave the app just as //evil.example would.
+export const safeReturnPath = (from: unknown) => (typeof from === 'string' && from.startsWith('/') && !from.startsWith('//') && !from.includes('\\') ? from : '/');
 
 export function LoginPage() {
   const { current } = useAuth();

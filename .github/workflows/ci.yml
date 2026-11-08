@@ -20,6 +20,55 @@ jobs:
         run: dotnet test --solution OrderFlow.sln --no-build --configuration Release --minimum-expected-tests 9
       - name: Validate Compose
         run: docker compose --env-file .env.example config --quiet
+      - name: Fail on a vulnerable NuGet package
+        run: |
+          dotnet list OrderFlow.sln package --vulnerable --include-transitive | tee vulnerable.txt
+          ! grep -q "has the following vulnerable packages" vulnerable.txt
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Scan the history for secrets
+        run: docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:v8.28.0 git /repo --redact --no-banner --config /repo/.gitleaks.toml
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Generate a throwaway SQL password
+        run: |
+          cp .env.example .env
+          sed -i "s/^MSSQL_SA_PASSWORD=.*/MSSQL_SA_PASSWORD=Ci$(openssl rand -hex 16)!/" .env
+      - name: Install tools
+        run: |
+          dotnet tool install --global dotnet-ef --version 10.0.12
+          npm --prefix orderflow-web ci
+          npx --prefix orderflow-web playwright install --with-deps chromium
+      - name: Integration tests
+        run: |
+          docker compose --env-file .env up -d sqlserver redis kafka
+          dotnet build OrderFlow.sln
+          dotnet test --solution OrderFlow.sln --no-build
+      - name: Process-level end-to-end run (AC-01 to AC-10)
+        run: pwsh tests/e2e/run-e2e.ps1 -LogDir "$RUNNER_TEMP/e2e"
+      - name: Browser journeys
+        env:
+          E2E_BROWSER_CHANNEL: chromium
+        run: pwsh tests/e2e/run-browser-e2e.ps1 -LogDir "$RUNNER_TEMP/browser-e2e"
+      - name: Keep the logs of a failed run
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-logs
+          path: ${{ runner.temp }}/*e2e*
   frontend:
     runs-on: ubuntu-latest
     defaults:
@@ -34,6 +83,8 @@ jobs:
           cache-dependency-path: orderflow-web/package-lock.json
       - name: Install
         run: npm ci
+      - name: Fail on a high-severity vulnerability in a runtime package
+        run: npm audit --omit=dev --audit-level=high
       - name: Test
         run: npm test
       - name: Build

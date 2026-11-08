@@ -271,6 +271,81 @@ try {
     $stockAfter = (Invoke-Api GET "/api/v1/inventory/$mainProduct" -token $adminToken).Body
     Equal $scenario 'Stock unchanged' "$($stockBefore.onHand)/$($stockBefore.reserved)" "$($stockAfter.onHand)/$($stockAfter.reserved)"
 
+    $scenario = 'AC-01 last unit under concurrency'
+    Write-Host "== $scenario =="
+    $lastUnit = New-Product $adminToken $category.Body.id 'LASTUNIT' 70000 1 $adminToken
+    $racers = @(1..4 | ForEach-Object {
+        $email = "race$_-$runId@example.invalid"
+        Register $email
+        $token = Sign-In $email
+        [pscustomobject]@{ Token = $token; CartId = (Invoke-Api POST '/api/v1/cart/items' @{ productId = $lastUnit; quantity = 1 } $token).Body.id; Key = "race-$_-$runId" }
+    })
+    # Separate runspaces send the checkouts at the same moment, and two Workers then compete for the unit.
+    $raced = @($racers | ForEach-Object -ThrottleLimit 4 -Parallel {
+        $body = @{ cartId = $_.CartId; shippingMethodId = $using:shippingMethodId; paymentMethod = 'CardSimulation'; couponCode = $null; deliveryAddress = $using:address } | ConvertTo-Json -Depth 4
+        # A deadlock victim is rolled back and answers CONCURRENCY_CONFLICT, and the contract says to retry it, which a client does with the same key.
+        $refusals = @()
+        for ($attempt = 1; $attempt -le 6; $attempt++) {
+            $response = Invoke-RestMethod -Method Post -Uri "$using:api/api/v1/orders" -Body $body -ContentType 'application/json; charset=utf-8' -Headers @{ Authorization = "Bearer $($_.Token)"; 'Idempotency-Key' = $_.Key } -SkipHttpErrorCheck -StatusCodeVariable code
+            if ([int]$code -eq 202) { break }
+            $refusals += "$code/$($response.code)"
+            Start-Sleep -Milliseconds (100 * $attempt)
+        }
+        [pscustomobject]@{ Status = [int]$code; Id = $response.id; Token = $_.Token; Refusals = $refusals }
+    })
+    Equal $scenario 'All four checkouts are accepted' 4 @($raced | Where-Object Status -eq 202).Count
+    $refusalCodes = @($raced | ForEach-Object { $_.Refusals })
+    Check $scenario 'Any refusal on the way was the documented retryable conflict' (@($refusalCodes | Where-Object { $_ -notin '409/CONCURRENCY_CONFLICT', '409/REQUEST_IN_PROGRESS' }).Count -eq 0) "refusals: $($refusalCodes.Count)"
+    Check $scenario 'Every order settles' (Wait-Until { @($raced | Where-Object { (Get-OrderStatus $_.Id $_.Token) -notin 'Processing', 'Rejected' }).Count -eq 0 } 120 1000)
+    $outcomes = @($raced | ForEach-Object { Get-OrderStatus $_.Id $_.Token })
+    Equal $scenario 'Exactly one order wins the unit' 1 @($outcomes | Where-Object { $_ -eq 'Processing' }).Count
+    Equal $scenario 'The other three are rejected' 3 @($outcomes | Where-Object { $_ -eq 'Rejected' }).Count
+    $stock = (Invoke-Api GET "/api/v1/inventory/$lastUnit" -token $adminToken).Body
+    Equal $scenario 'Stock ends at zero, never negative' '0/0/0' "$($stock.onHand)/$($stock.reserved)/$($stock.available)"
+    Equal $scenario 'One reservation was committed' 1 (Sql "SELECT COUNT(*) FROM dbo.InventoryReservations WHERE ProductId = '$lastUnit' AND Status = 'Committed'")
+
+    $scenario = 'AC-06 cache invalidation'
+    Write-Host "== $scenario =="
+    $cachedProduct = New-Product $adminToken $category.Body.id 'CACHED' 80000 5 $adminToken
+    $first = (Invoke-Api GET "/api/v1/products/$cachedProduct").Body
+    Invoke-Api GET "/api/v1/products/$cachedProduct" | Out-Null
+    Check $scenario 'The read is stored in Redis' (Wait-Until { "$(Compose exec -T redis redis-cli --scan --pattern "${database}:product:${cachedProduct}:v1")" -match $cachedProduct } 15)
+    $updateBody = @{ categoryId = $category.Body.id; sku = $first.sku; name = 'E2E renamed'; description = 'E2E'; price = 81000; currencyCode = 'VND'; isActive = $true; version = $first.version }
+    Equal $scenario 'Admin updates the product' 200 (Invoke-Api PUT "/api/v1/products/$cachedProduct" $updateBody $adminToken).Status
+    $renamed = (Invoke-Api GET "/api/v1/products/$cachedProduct").Body
+    Equal $scenario 'The next read has the new value' 'E2E renamed/81000' "$($renamed.name)/$($renamed.price)"
+    Equal $scenario 'A stale version is refused' 'CONCURRENCY_CONFLICT' (Invoke-Api PUT "/api/v1/products/$cachedProduct" $updateBody $adminToken).Body.code
+
+    $scenario = 'AC-05 Redis outage'
+    Write-Host "== $scenario =="
+    Compose stop redis 2>&1 | Out-Null
+    Check $scenario 'Readiness reports Redis as Degraded while staying ready' (Wait-Until { $health = Invoke-Api GET '/health/ready'; $health.Status -eq 200 -and $health.Body.checks.redis.status -eq 'Degraded' } 30)
+    $fallback = Invoke-Api GET "/api/v1/products/$cachedProduct"
+    Equal $scenario 'Product detail falls back to SQL Server' '200/E2E renamed/5' "$($fallback.Status)/$($fallback.Body.name)/$($fallback.Body.available)"
+    Equal $scenario 'Product search still answers' 200 (Invoke-Api GET '/api/v1/products?pageSize=5').Status
+    $withoutRedis = Place-Order $customerToken $cachedProduct 1 'COD'
+    Equal $scenario 'Checkout completes without Redis' 'Processing' (Wait-OrderStatus $withoutRedis.Order.id 'Processing' $customerToken)
+    $outageUpdate = @{ categoryId = $category.Body.id; sku = $first.sku; name = 'E2E outage rename'; description = 'E2E'; price = 82000; currencyCode = 'VND'; isActive = $true }
+    Equal $scenario 'A catalog change commits during the outage' 200 (Invoke-Api PUT "/api/v1/products/$cachedProduct" $outageUpdate $adminToken).Status
+    Compose start redis 2>&1 | Out-Null
+    Check $scenario 'Readiness recovers' (Wait-Until { (Invoke-Api GET '/health/ready').Body.checks.redis.status -eq 'Healthy' } 60 1000)
+    Check $scenario 'Reads after recovery show the outage change, not a stale entry' (Wait-Until { (Invoke-Api GET "/api/v1/products/$cachedProduct").Body.name -eq 'E2E outage rename' } 60 1000)
+
+    $scenario = 'AC-07 invalid transitions'
+    Write-Host "== $scenario =="
+    $settled = Place-Order $customerToken $mainProduct 1 'COD'
+    Equal $scenario 'Order reaches Processing' 'Processing' (Wait-OrderStatus $settled.Order.id 'Processing' $customerToken)
+    $mainSold++
+    $historyBefore = Sql "SELECT COUNT(*) FROM dbo.OrderStatusHistories WHERE OrderId = '$($settled.Order.id)'"
+    $stockBefore = (Invoke-Api GET "/api/v1/inventory/$mainProduct" -token $adminToken).Body
+    Equal $scenario 'Customer cancellation is refused' 'INVALID_STATE_TRANSITION' (Invoke-Api POST "/api/v1/orders/$($settled.Order.id)/cancel" @{ reason = 'Too late' } $customerToken).Body.code
+    Equal $scenario 'A return before delivery is refused' 'RETURN_NOT_ELIGIBLE' (Invoke-Api POST "/api/v1/orders/$($settled.Order.id)/returns" @{ reason = 'Early' } $customerToken).Body.code
+    Equal $scenario 'The order did not move' 'Processing' (Get-OrderStatus $settled.Order.id $customerToken)
+    Equal $scenario 'No history was added' $historyBefore (Sql "SELECT COUNT(*) FROM dbo.OrderStatusHistories WHERE OrderId = '$($settled.Order.id)'")
+    Equal $scenario 'No cancellation event was stored' 0 (Sql "SELECT COUNT(*) FROM dbo.OutboxMessages WHERE AggregateId = '$($settled.Order.id)' AND EventType = 'OrderCancelled'")
+    $stockAfter = (Invoke-Api GET "/api/v1/inventory/$mainProduct" -token $adminToken).Body
+    Equal $scenario 'Stock did not move' "$($stockBefore.onHand)/$($stockBefore.reserved)" "$($stockAfter.onHand)/$($stockAfter.reserved)"
+
     $scenario = 'AC-03 Kafka outage'
     Write-Host "== $scenario =="
     Compose stop kafka 2>&1 | Out-Null
@@ -519,7 +594,7 @@ catch {
 }
 finally {
     Stop-All
-    Compose start kafka 2>&1 | Out-Null
+    Compose start kafka redis 2>&1 | Out-Null
     if (-not $KeepDatabase) { Compose exec -T -e "SQLCMDPASSWORD=$password" sqlserver /opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -Q "ALTER DATABASE [$database] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [$database]" 2>&1 | Out-Null }
 }
 

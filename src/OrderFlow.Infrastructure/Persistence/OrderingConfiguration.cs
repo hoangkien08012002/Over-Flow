@@ -53,7 +53,7 @@ internal sealed class OrderConfiguration : IEntityTypeConfiguration<Order>
     public void Configure(EntityTypeBuilder<Order> e)
     { e.ToTable("Orders", t => t.HasCheckConstraint("CK_Orders_Money", "[Subtotal] >= 0 AND [DiscountTotal] >= 0 AND [DiscountTotal] <= [Subtotal] AND [ShippingFee] >= 0 AND [GrandTotal] >= 0"));
       e.HasKey(x => x.Id); e.Property(x => x.Id).ValueGeneratedNever(); e.Property(x => x.OrderNumber).HasMaxLength(32).IsRequired(); e.HasIndex(x => x.OrderNumber).IsUnique();
-      e.HasIndex(x => new { x.UserId, x.CreatedAtUtc }); e.HasIndex(x => x.Status); e.Property(x => x.Status).HasConversion<string>().HasMaxLength(30);
+      e.HasIndex(x => new { x.UserId, x.CreatedAtUtc }); e.HasIndex(x => new { x.Status, x.CreatedAtUtc }); e.Property(x => x.Status).HasConversion<string>().HasMaxLength(30);
       foreach (var name in new[] { nameof(Order.Subtotal), nameof(Order.DiscountTotal), nameof(Order.ShippingFee), nameof(Order.GrandTotal) }) e.Property<decimal>(name).HasColumnType("decimal(18,2)");
       e.Property(x => x.CurrencyCode).HasMaxLength(3).IsFixedLength(); e.Property(x => x.PaymentMethod).HasMaxLength(30); e.Property(x => x.ShippingMethodName).HasMaxLength(150);
       e.Property(x => x.AddressSnapshotJson).HasMaxLength(CheckoutService.MaxAddressSnapshotLength); e.Property(x => x.RowVersion).IsRowVersion();

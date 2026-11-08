@@ -35,7 +35,9 @@ public static class OrderingEndpoints
         if (result.Code is not null)
         {
             if (result.Code == "REQUEST_IN_PROGRESS") context.Response.Headers.RetryAfter = "1";
-            return Error(context, result.StatusCode, result.Code);
+            return result.Errors is null ? Error(context, result.StatusCode, result.Code) : Results.Json(new
+            { type = $"https://orderflow/errors/{result.Code.ToLowerInvariant()}", title = "Request validation failed", status = result.StatusCode, result.Code, correlationId = Correlation(context), errors = result.Errors },
+                statusCode: result.StatusCode, contentType: "application/problem+json");
         }
         return Results.Content(result.Body, "application/json", statusCode: result.StatusCode);
     }
@@ -50,6 +52,7 @@ public static class OrderingEndpoints
                               where productIds.Contains(p.Id) select new { Product = p, CategoryActive = category.IsActive }).ToDictionaryAsync(x => x.Product.Id, ct);
         var stock = await db.Inventories.AsNoTracking().Where(x => productIds.Contains(x.ProductId)).ToDictionaryAsync(x => x.ProductId, ct);
         var items = cart.Items.Select(x => new { x.Id, x.ProductId, x.Quantity,
+            currencyCode = products.TryGetValue(x.ProductId, out var product) ? product.Product.CurrencyCode : null,
             productName = products.TryGetValue(x.ProductId, out var p) ? p.Product.Name : null,
             currentUnitPrice = products.TryGetValue(x.ProductId, out p) ? p.Product.Price : 0m,
             available = products.TryGetValue(x.ProductId, out p) && p.Product.IsActive && p.CategoryActive && stock.TryGetValue(x.ProductId, out var i) ? i.Available : 0,

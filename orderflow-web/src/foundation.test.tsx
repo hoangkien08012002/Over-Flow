@@ -24,8 +24,8 @@ beforeEach(() => session.clear());
 
 describe('error mapping', () => {
   it('keeps the correlation ID from the problem body', () => {
-    const error = toApiError(failure(blank, 409, { code: 'INVALID_STATE_TRANSITION', title: 'Bad transition', correlationId: 'corr-1' }));
-    expect(error).toMatchObject({ status: 409, code: 'INVALID_STATE_TRANSITION', correlationId: 'corr-1', message: 'Bad transition' });
+    const error = toApiError(failure(blank, 409, { code: 'NEW_BUSINESS_RULE', title: 'Bad transition', correlationId: 'corr-1' }));
+    expect(error).toMatchObject({ status: 409, code: 'NEW_BUSINESS_RULE', correlationId: 'corr-1', message: 'Bad transition' });
   });
 
   it('falls back to the response header when the body has none', () => {

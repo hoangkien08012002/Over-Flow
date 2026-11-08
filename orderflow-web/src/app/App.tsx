@@ -3,6 +3,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { RouterProvider, createBrowserRouter } from 'react-router-dom';
 import { ApiError } from '../api/errors';
 import { AuthProvider } from '../features/auth/AuthProvider';
+import { session } from '../features/auth/session';
 import { routes } from './routes';
 
 const router = createBrowserRouter(routes);
@@ -14,6 +15,14 @@ const queryClient = new QueryClient({
       retry: (count, error) => count < 2 && !(error instanceof ApiError && error.status >= 400 && error.status < 500)
     }
   }
+});
+
+// One account's cached data must not be shown to the next person on this browser, whether the session ended by signing out or by expiring.
+let signedInAs: string | null = null;
+session.subscribe(() => {
+  const user = session.get()?.user.id ?? null;
+  if (signedInAs && signedInAs !== user) queryClient.clear();
+  signedInAs = user;
 });
 
 export function App() {

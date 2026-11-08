@@ -18,6 +18,11 @@ using OrderFlow.Infrastructure.Identity;
 using OrderFlow.Infrastructure.Persistence;
 using Xunit;
 
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Routing;
+using Microsoft.Extensions.DependencyInjection;
+
 namespace OrderFlow.IntegrationTests;
 
 public sealed class OrderingApiSqlTests
@@ -294,7 +299,10 @@ public sealed class OrderingApiSqlTests
         Assert.Equal(acceptedBody, await replay.Content.ReadAsStringAsync(ct));
 
         using (var rejected = await ReadJsonAsync(await PostOrderAsync(customer, "empty-cart-key-2", CheckoutBody(cartId), ct), ct, HttpStatusCode.BadRequest))
+        {
             Assert.Equal("VALIDATION_FAILED", rejected.RootElement.GetProperty("code").GetString());
+            Assert.Equal("The cart is empty.", rejected.RootElement.GetProperty("errors").GetProperty("cartId")[0].GetString());
+        }
         Assert.Equal(1, await setup.Orders.AsNoTracking().CountAsync(ct));
         Assert.Equal(1, await setup.OutboxMessages.AsNoTracking().CountAsync(x => x.EventType == "OrderCreated", ct));
 
@@ -346,6 +354,76 @@ public sealed class OrderingApiSqlTests
     });
 
     private sealed record Seed(ApplicationUser User, Product Stocked, Product WithoutStock);
+
+    [Fact]
+    public Task FR_ORD_001_refused_coupon_names_its_field_and_leaves_no_key_record() => WithDatabaseAsync(async (connection, _, setup, seed, ct) =>
+    {
+        await using var factory = new OrderingFactory(connection);
+        using var customer = await CustomerClientAsync(factory, "coupon-field@example.invalid", ct);
+        Guid cartId;
+        using (var cart = await AddItemAsync(customer, seed.Stocked.Id, 1, ct)) cartId = cart.RootElement.GetProperty("id").GetGuid();
+
+        var refusedBody = new CheckoutRequest(cartId, ShippingMethodId, "COD", "NO-SUCH-COUPON", Address);
+        using (var refused = await ReadJsonAsync(await PostOrderAsync(customer, "coupon-field-key", refusedBody, ct), ct, HttpStatusCode.BadRequest))
+        {
+            Assert.Equal("VALIDATION_FAILED", refused.RootElement.GetProperty("code").GetString());
+            Assert.Equal("This coupon cannot be applied to this order.", refused.RootElement.GetProperty("errors").GetProperty("couponCode")[0].GetString());
+            Assert.False(string.IsNullOrEmpty(refused.RootElement.GetProperty("correlationId").GetString()));
+        }
+        Assert.Equal(0, await setup.IdempotencyRecords.AsNoTracking().CountAsync(ct));
+
+        // The refusal stored nothing, so the customer can correct the form and keep the same key without a conflict.
+        Assert.Equal(HttpStatusCode.Accepted, (await PostOrderAsync(customer, "coupon-field-key", CheckoutBody(cartId), ct)).StatusCode);
+    });
+
+    // Regression from the Phase 14 benchmark: under Serializable, reading one cart's items held range locks over other customers' rows, and most concurrent checkouts deadlocked.
+    [Fact]
+    public Task NFR_REL_002_customers_checking_out_at_once_do_not_conflict_with_each_other() => WithDatabaseAsync(async (connection, _, setup, seed, ct) =>
+    {
+        const int customers = 8, rounds = 3;
+        await setup.Database.ExecuteSqlInterpolatedAsync($"UPDATE dbo.Inventories SET OnHand = 1000 WHERE ProductId = {seed.Stocked.Id}", ct);
+        await using var factory = new OrderingFactory(connection);
+        var clients = new List<HttpClient>();
+        for (var i = 0; i < customers; i++) clients.Add(await CustomerClientAsync(factory, $"concurrent-{i}@example.invalid", ct));
+        var statuses = new List<HttpStatusCode>();
+        for (var round = 0; round < rounds; round++)
+        {
+            var carts = new List<Guid>();
+            foreach (var client in clients)
+                using (var cart = await AddItemAsync(client, seed.Stocked.Id, 1, ct)) carts.Add(cart.RootElement.GetProperty("id").GetGuid());
+            var currentRound = round;
+            var responses = await Task.WhenAll(clients.Select((client, i) => PostOrderAsync(client, $"concurrent-{currentRound}-{i}", CheckoutBody(carts[i]), ct)));
+            statuses.AddRange(responses.Select(x => x.StatusCode));
+        }
+        foreach (var client in clients) client.Dispose();
+
+        Assert.Equal(customers * rounds, statuses.Count(x => x == HttpStatusCode.Accepted));
+        Assert.Equal(customers * rounds, await setup.Orders.AsNoTracking().CountAsync(ct));
+    });
+
+    // Fails when someone adds a route and forgets its policy: public routes are named here, and everything else must declare one.
+    [Fact]
+    public Task Every_route_outside_the_public_list_requires_authorization() => WithDatabaseAsync(async (connection, _, _, _, ct) =>
+    {
+        string[] anonymous =
+        [
+            "POST /api/v1/auth/register", "POST /api/v1/auth/login", "POST /api/v1/auth/refresh", "POST /api/v1/auth/logout",
+            "GET /api/v1/categories/", "GET /api/v1/products/", "GET /api/v1/products/{id:guid}", "GET /api/v1/products/{productId:guid}/reviews", "GET /api/v1/shipping-methods"
+        ];
+        await using var factory = new OrderingFactory(connection);
+        using var _ = factory.CreateClient();
+        var routes = factory.Services.GetRequiredService<EndpointDataSource>().Endpoints.OfType<RouteEndpoint>()
+            .Where(x => x.RoutePattern.RawText?.StartsWith("/api/v1", StringComparison.Ordinal) == true)
+            .SelectMany(x => (x.Metadata.GetMetadata<HttpMethodMetadata>()?.HttpMethods ?? []).Select(method => (Name: $"{method} {x.RoutePattern.RawText}", x.Metadata)))
+            .ToList();
+        Assert.True(routes.Count > 50, $"Only {routes.Count} routes were found, so the check is not looking at the API.");
+
+        Assert.Empty(routes.Where(x => !anonymous.Contains(x.Name) && x.Metadata.GetMetadata<IAuthorizeData>() is null).Select(x => x.Name));
+        Assert.Empty(anonymous.Except(routes.Select(x => x.Name)));
+        // Staff routes must name a staff policy. A bare RequireAuthorization would admit every customer.
+        string[] staffPolicies = ["Admin", "OrderStaff", "ReturnStaff", "Fulfillment"];
+        Assert.Empty(routes.Where(x => x.Name.Contains("/api/v1/admin", StringComparison.Ordinal) && !staffPolicies.Contains(x.Metadata.GetMetadata<IAuthorizeData>()?.Policy)).Select(x => x.Name));
+    });
 
     private static async Task WithDatabaseAsync(Func<string, DbContextOptions<OrderFlowDbContext>, OrderFlowDbContext, Seed, CancellationToken, Task> test)
     {

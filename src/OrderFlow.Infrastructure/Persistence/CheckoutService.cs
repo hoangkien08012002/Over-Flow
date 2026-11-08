@@ -17,7 +17,11 @@ public sealed record DeliveryAddress(string RecipientName, string Phone, string 
 public sealed record CheckoutRequest(Guid CartId, Guid ShippingMethodId, string PaymentMethod, string? CouponCode, DeliveryAddress DeliveryAddress);
 public sealed record OrderResponse(Guid Id, string OrderNumber, string Status, decimal Subtotal, decimal DiscountTotal,
     decimal ShippingFee, decimal GrandTotal, string CurrencyCode, string StatusUrl);
-public sealed record CheckoutResult(int StatusCode, string? Code, string? Body);
+public sealed record CheckoutResult(int StatusCode, string? Code, string? Body, IReadOnlyDictionary<string, string[]>? Errors = null)
+{
+    // The code stays VALIDATION_FAILED for every case. The field tells a client what to show next to its form.
+    public static CheckoutResult Invalid(string field, string message) => new(400, "VALIDATION_FAILED", null, new Dictionary<string, string[]> { [field] = [message] });
+}
 
 public sealed class OrderingOptions
 {
@@ -46,7 +50,9 @@ public sealed class CheckoutService(OrderFlowDbContext db, TimeProvider clock, I
         if (existing is not null && existing.ExpiresAtUtc > requestTime) return Replay(existing, hash);
         try
         {
-            await using var transaction = await db.Database.BeginTransactionAsync(IsolationLevel.Serializable, ct);
+            // Each invariant has its own guard: the unique index decides the key, and UPDLOCK serializes one cart and one coupon.
+            // Serializable added nothing to these, and its range locks on CartItems covered other customers' rows, so unrelated checkouts deadlocked.
+            await using var transaction = await db.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
             if (existing is not null && existing.ExpiresAtUtc <= requestTime)
                 await db.IdempotencyRecords.Where(x => x.Id == existing.Id && x.ExpiresAtUtc <= requestTime).ExecuteDeleteAsync(ct);
             var record = new IdempotencyRecord(userId, key, hash, requestTime,
@@ -56,16 +62,16 @@ public sealed class CheckoutService(OrderFlowDbContext db, TimeProvider clock, I
             // Serializes checkouts of one cart: the later one waits, then sees the emptied cart instead of deadlocking on the item delete.
             var cart = await db.Carts.FromSqlInterpolated($"SELECT * FROM dbo.Carts WITH (UPDLOCK, ROWLOCK) WHERE Id = {request.CartId} AND UserId = {userId}")
                 .Include(x => x.Items).SingleOrDefaultAsync(ct);
-            if (cart is null || cart.Items.Count == 0) return new(400, "VALIDATION_FAILED", null);
+            if (cart is null || cart.Items.Count == 0) return CheckoutResult.Invalid("cartId", "The cart is empty.");
             var method = await db.ShippingMethods.AsNoTracking().SingleOrDefaultAsync(x => x.Id == request.ShippingMethodId && x.IsActive, ct);
-            if (method is null) return new(400, "VALIDATION_FAILED", null);
+            if (method is null) return CheckoutResult.Invalid("shippingMethodId", "This shipping method is not available.");
             var productIds = cart.Items.Select(x => x.ProductId).ToList();
             var products = await (from p in db.Products.AsNoTracking()
                                   join category in db.Categories.AsNoTracking() on p.CategoryId equals category.Id
                                   where productIds.Contains(p.Id) && p.IsActive && category.IsActive
                                   select p).ToDictionaryAsync(x => x.Id, ct);
             if (products.Count != productIds.Count || products.Values.Any(x => x.CurrencyCode != method.CurrencyCode))
-                return new(400, "VALIDATION_FAILED", null);
+                return CheckoutResult.Invalid("cartId", "An item in the cart is no longer for sale.");
             var now = clock.GetUtcNow();
             var orderId = Guid.NewGuid();
             var items = cart.Items.OrderBy(x => x.ProductId).Select(x => new OrderItem(orderId, x.ProductId, products[x.ProductId].Sku,
@@ -80,7 +86,7 @@ public sealed class CheckoutService(OrderFlowDbContext db, TimeProvider clock, I
                 if (coupon is null || !coupon.IsEnabled || now < coupon.ValidFromUtc || now >= coupon.ValidUntilUtc || subtotal < coupon.MinimumSubtotal ||
                     coupon.TotalUsageLimit is int limit && coupon.UsageCount >= limit ||
                     coupon.PerUserUsageLimit is int userLimit && await db.CouponUsages.CountAsync(x => x.CouponId == coupon.Id && x.UserId == userId && x.ReleasedAtUtc == null, ct) >= userLimit)
-                    return new(400, "VALIDATION_FAILED", null);
+                    return CheckoutResult.Invalid("couponCode", "This coupon cannot be applied to this order.");
                 discount = coupon.CalculateDiscount(subtotal);
                 coupon.Use();
                 // Apply the discount to one line so line and order totals agree.
