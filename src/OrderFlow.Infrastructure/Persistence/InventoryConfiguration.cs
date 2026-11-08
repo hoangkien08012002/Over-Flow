@@ -57,6 +57,7 @@ internal sealed class InventoryReservationConfiguration : IEntityTypeConfigurati
         entity.Property(x => x.RowVersion).IsRowVersion();
         entity.HasIndex(x => new { x.OrderId, x.ProductId }).IsUnique();
         entity.HasIndex(x => new { x.Status, x.ExpiresAtUtc });
+        entity.HasIndex(x => new { x.ProductId, x.CreatedAtUtc });
         entity.HasOne<Product>().WithMany().HasForeignKey(x => x.ProductId).OnDelete(DeleteBehavior.Restrict);
     }
 }

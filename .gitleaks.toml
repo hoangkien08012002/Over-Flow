@@ -1,0 +1,15 @@
+title = "OrderFlow secret scan"
+
+[extend]
+useDefault = true
+
+# These are public placeholders and test-only values, documented as such where they are used. Everything else stays in scope.
+[allowlist]
+description = "Documented placeholders and test-only values"
+paths = ['''package-lock\.json$''']
+regexes = [
+  '''ReplaceWithStrongLocalPassword123!''',
+  '''StrongPassword123!''',
+  '''OrderFlow-Demo-2026!''',
+  '''TEST_ONLY_[A-Za-z0-9_]+'''
+]

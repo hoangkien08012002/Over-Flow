@@ -12,6 +12,6 @@ export default defineConfig(({ mode }) => {
       // The browser sees one origin in development, so the SameSite=Strict refresh cookie works without CORS.
       proxy: { '/api': { target, changeOrigin: false }, '/health': { target, changeOrigin: false } }
     },
-    test: { environment: 'jsdom', globals: true, setupFiles: './src/test-setup.ts' }
+    test: { environment: 'jsdom', globals: true, setupFiles: './src/test-setup.ts', include: ['src/**/*.test.{ts,tsx}'] }
   };
 });

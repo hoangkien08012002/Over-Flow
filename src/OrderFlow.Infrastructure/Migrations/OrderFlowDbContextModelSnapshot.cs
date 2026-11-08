@@ -560,10 +560,10 @@ namespace OrderFlow.Infrastructure.Migrations
 
                     b.HasKey("Id");
 
-                    b.HasIndex("ProductId");
-
                     b.HasIndex("OrderId", "ProductId")
                         .IsUnique();
+
+                    b.HasIndex("ProductId", "CreatedAtUtc");
 
                     b.HasIndex("Status", "ExpiresAtUtc");
 
@@ -905,7 +905,7 @@ namespace OrderFlow.Infrastructure.Migrations
 
                     b.HasIndex("ShippingMethodId");
 
-                    b.HasIndex("Status");
+                    b.HasIndex("Status", "CreatedAtUtc");
 
                     b.HasIndex("UserId", "CreatedAtUtc");
 
