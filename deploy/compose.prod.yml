@@ -1,0 +1,160 @@
+# Production-like stack: every component in a container, only the HTTPS edge published, persistent data in named volumes.
+# Use it through deploy/deploy.ps1, which runs migrations as a separate step before starting the new application version.
+#   docker compose -f deploy/compose.prod.yml --env-file deploy/.env.prod <command>
+# Secrets come only from deploy/.env.prod, which is ignored by Git. See deploy/.env.prod.example.
+name: ${COMPOSE_PROJECT_NAME:-orderflow-prod}
+
+# Built here from the SA password so the secret is configured once. Traffic stays on the internal network; the container's certificate is self-signed.
+x-sql-connection: &sql-connection "Server=sqlserver,1433;Database=${SQL_DATABASE:-OrderFlow};User ID=sa;Password=${MSSQL_SA_PASSWORD:?Set MSSQL_SA_PASSWORD in deploy/.env.prod};Encrypt=True;TrustServerCertificate=True"
+
+x-dotnet-app: &dotnet-app
+  restart: unless-stopped
+  # Longer than the 30-second host shutdown timeout, so Docker does not kill a process that is still draining.
+  stop_grace_period: 40s
+  networks: [backend]
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "5" }
+
+services:
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    restart: unless-stopped
+    environment:
+      ACCEPT_EULA: "Y"
+      # Developer edition is for rehearsals only. A real deployment needs a licensed edition or Express.
+      MSSQL_PID: ${MSSQL_PID:-Developer}
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:?Set MSSQL_SA_PASSWORD in deploy/.env.prod}
+    volumes:
+      # Backups are written under /var/opt/mssql/backups in this volume, which the mssql user owns, then copied off by backup.ps1.
+      - sql_data:/var/opt/mssql
+    networks: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -Q 'SELECT 1' -b -o /dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    # Redis only holds cache entries, so append-only persistence is a warm-restart convenience, not a durability requirement.
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    volumes:
+      - redis_data:/data
+    networks: [backend]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  kafka:
+    image: apache/kafka:4.3.1
+    hostname: kafka
+    restart: unless-stopped
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_LISTENERS: CONTROLLER://:29093,PLAINTEXT://:19092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:19092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      CLUSTER_ID: ${KAFKA_CLUSTER_ID:-Q2fHVmEtT0a3zcU1d0RkWg}
+      # Without this the image writes its log under /tmp, and committed events would not survive a container replacement.
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    networks: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:19092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  # One-shot and opt-in: deploy.ps1 runs it once per release, so API replicas never race each other to migrate.
+  migrator:
+    image: ${IMAGE_REGISTRY:-orderflow}/migrator:${IMAGE_TAG:-local}
+    build: { context: .., dockerfile: Dockerfile, target: migrator }
+    profiles: [tools]
+    environment:
+      ORDERFLOW_SQL_CONNECTION: *sql-connection
+    networks: [backend]
+    depends_on:
+      sqlserver: { condition: service_healthy }
+
+  api:
+    <<: *dotnet-app
+    image: ${IMAGE_REGISTRY:-orderflow}/api:${IMAGE_TAG:-local}
+    build: { context: .., dockerfile: Dockerfile, target: api }
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      ConnectionStrings__OrderFlow: *sql-connection
+      Jwt__Issuer: ${JWT_ISSUER:-OrderFlow}
+      Jwt__Audience: ${JWT_AUDIENCE:-OrderFlow.Api}
+      Jwt__SigningKey: ${JWT_SIGNING_KEY:?Set JWT_SIGNING_KEY in deploy/.env.prod}
+      Redis__ConnectionString: redis:6379
+      Kafka__BootstrapServers: kafka:19092
+      # Only the edge may set the client address and scheme; anything else would let a client pick its rate-limit partition.
+      Proxy__TrustedProxies__0: ${EDGE_IP:-172.30.0.10}
+      RateLimits__Refresh: ${RATE_LIMIT_REFRESH:-20}
+      Telemetry__OtlpEndpoint: ${OTLP_ENDPOINT:-}
+    depends_on:
+      sqlserver: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+
+  worker:
+    <<: *dotnet-app
+    image: ${IMAGE_REGISTRY:-orderflow}/worker:${IMAGE_TAG:-local}
+    build: { context: .., dockerfile: Dockerfile, target: worker }
+    environment:
+      DOTNET_ENVIRONMENT: Production
+      ConnectionStrings__OrderFlow: *sql-connection
+      Kafka__BootstrapServers: kafka:19092
+      Payments__DeclineCents: ${PAYMENT_DECLINE_CENTS:-13}
+      Telemetry__OtlpEndpoint: ${OTLP_ENDPOINT:-}
+    depends_on:
+      sqlserver: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+
+  web:
+    image: ${IMAGE_REGISTRY:-orderflow}/web:${IMAGE_TAG:-local}
+    build: { context: .., dockerfile: orderflow-web/Dockerfile, target: web }
+    restart: unless-stopped
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:-localhost}
+    ports:
+      - "${HTTP_BIND:-127.0.0.1}:${HTTP_PORT:-80}:80"
+      - "${HTTP_BIND:-127.0.0.1}:${HTTPS_PORT:-443}:443"
+    volumes:
+      # Keeps issued certificates and the internal CA across restarts, which also avoids Let's Encrypt rate limits.
+      - caddy_data:/data
+    networks:
+      backend:
+        ipv4_address: ${EDGE_IP:-172.30.0.10}
+    depends_on:
+      api: { condition: service_healthy }
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "5" }
+
+networks:
+  backend:
+    ipam:
+      config:
+        - subnet: ${BACKEND_SUBNET:-172.30.0.0/24}
+
+volumes:
+  sql_data:
+  redis_data:
+  kafka_data:
+  caddy_data:

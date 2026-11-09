@@ -64,3 +64,8 @@ CodeCoverage/
 *.VisualState.xml
 TestResult.xml
 nunit-*.xml
+
+# Deployment secrets, release history, and backups stay on the deployment host
+deploy/.env.*
+!deploy/.env.prod.example
+deploy/backups/
