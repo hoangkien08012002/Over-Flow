@@ -1,0 +1,23 @@
+# Keeps the build context small and keeps local secrets and caches out of every image layer.
+**/bin/
+**/obj/
+**/node_modules/
+**/dist/
+**/test-results/
+**/TestResults/
+.git/
+.vs/
+.vscode/
+.claude/
+.tools/
+.dotnet-cli/
+.nuget/
+.env
+.env.*
+deploy/.env.prod
+deploy/backups/
+**/appsettings.Development.json
+**/*.user
+docs/
+tests/
+*.docx

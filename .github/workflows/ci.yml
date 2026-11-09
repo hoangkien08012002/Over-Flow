@@ -69,6 +69,32 @@ jobs:
         with:
           name: e2e-logs
           path: ${{ runner.temp }}/*e2e*
+  containers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate the production Compose file
+        run: docker compose -f deploy/compose.prod.yml --env-file deploy/.env.prod.example config --quiet
+      # Generates its own throwaway secrets. Clean deployment, backup and test restore, upgrade, and rollback,
+      # each followed by the HTTPS smoke test.
+      - name: Deployment and rollback rehearsal
+        run: pwsh deploy/rehearse.ps1
+      - name: Scan the images for fixable critical vulnerabilities
+        run: |
+          tag="$(git rev-parse --short HEAD)-a"
+          for image in api worker web migrator; do
+            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:0.58.1 image \
+              --exit-code 1 --severity CRITICAL --ignore-unfixed --no-progress "orderflow-rehearsal/$image:$tag"
+          done
+      - name: Keep the logs of a failed rehearsal
+        if: failure()
+        run: docker compose -f deploy/compose.prod.yml --env-file deploy/.env.rehearsal logs --no-color > rehearsal.log || true
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rehearsal-logs
+          path: rehearsal.log
   frontend:
     runs-on: ubuntu-latest
     defaults:

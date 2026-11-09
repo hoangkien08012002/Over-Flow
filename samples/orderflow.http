@@ -1,0 +1,87 @@
+# OrderFlow sample requests. Open in Visual Studio 2026 or VS Code with the REST Client extension and run them top to bottom.
+# Prerequisites: the API and Worker are running, and scripts/seed-dev.ps1 has created the demo accounts and products.
+# The demo password belongs to the local seed accounts only.
+@baseUrl = http://localhost:53375/api/v1
+@password = OrderFlow-Demo-2026!
+
+### 1. Browse the catalog anonymously (served through the Redis cache-aside path)
+# @name products
+GET {{baseUrl}}/products?search=lamp&isAvailable=true&sort=price&page=1&pageSize=5
+
+### 2. Product detail. The first read is a cache miss, the next one a hit (watch orderflow.cache.hits)
+GET {{baseUrl}}/products/{{products.response.body.$.items[0].id}}
+
+### 3. Sign in as the customer. API clients get both tokens in JSON; the web client asks for the refresh cookie instead
+# @name customer
+POST {{baseUrl}}/auth/login
+Content-Type: application/json
+
+{ "email": "customer@orderflow.example", "password": "{{password}}" }
+
+### 4. Put one unit in the cart
+# @name cart
+POST {{baseUrl}}/cart/items
+Authorization: Bearer {{customer.response.body.$.accessToken}}
+Content-Type: application/json
+
+{ "productId": "{{products.response.body.$.items[0].id}}", "quantity": 1 }
+
+### 5. Shipping methods offered at checkout
+# @name shipping
+GET {{baseUrl}}/shipping-methods
+
+### 6. Checkout. Returns 202 with a PendingInventory order; the Worker does the rest.
+# Use a new key for each new order. Send it twice with the same key: the second answer is the stored first one, and no second order is created (AC-02).
+# Change the body but keep the key: 409 IDEMPOTENCY_KEY_REUSED.
+# @name order
+POST {{baseUrl}}/orders
+Authorization: Bearer {{customer.response.body.$.accessToken}}
+Content-Type: application/json
+Idempotency-Key: sample-checkout-0001
+X-Correlation-Id: sample-trace-0001
+
+{
+  "cartId": "{{cart.response.body.$.id}}",
+  "shippingMethodId": "{{shipping.response.body.$[0].id}}",
+  "paymentMethod": "CardSimulation",
+  "couponCode": null,
+  "deliveryAddress": {
+    "recipientName": "Demo Customer",
+    "phone": "0900000000",
+    "line1": "1 Demo Street",
+    "ward": "Ward 1",
+    "district": "District 1",
+    "province": "Ho Chi Minh City",
+    "countryCode": "VN"
+  }
+}
+
+### 7. Follow the order: PendingInventory -> AwaitingPayment -> Paid -> Processing, with its status history
+GET {{baseUrl}}/orders/{{order.response.body.$.id}}
+Authorization: Bearer {{customer.response.body.$.accessToken}}
+
+### 8. Order history, newest first
+GET {{baseUrl}}/orders?page=1&pageSize=10
+Authorization: Bearer {{customer.response.body.$.accessToken}}
+
+### 9. Sign in as the Admin
+# @name admin
+POST {{baseUrl}}/auth/login
+Content-Type: application/json
+
+{ "email": "admin@orderflow.example", "password": "{{password}}" }
+
+### 10. Staff view of every order
+GET {{baseUrl}}/admin/orders?page=1&pageSize=10
+Authorization: Bearer {{admin.response.body.$.accessToken}}
+
+### 11. Messages that used all their retries, and the audit log
+GET {{baseUrl}}/admin/failed-messages
+Authorization: Bearer {{admin.response.body.$.accessToken}}
+
+###
+GET {{baseUrl}}/admin/audit-logs?page=1&pageSize=10
+Authorization: Bearer {{admin.response.body.$.accessToken}}
+
+### 12. Readiness: SQL Server, Redis, and Kafka. Stop Redis and it reports Degraded while the API keeps serving
+GET http://localhost:53375/health/ready
