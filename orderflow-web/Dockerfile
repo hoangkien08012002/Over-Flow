@@ -11,6 +11,9 @@ RUN npm ci --no-audit --no-fund
 COPY orderflow-web/ ./
 RUN npm run build
 
-FROM caddy:2.10-alpine AS web
+# Pinned to a patch release so a rebuild is reproducible; bump it when the CI image scan reports a fixed vulnerability.
+FROM caddy:2.11.7-alpine AS web
+# Applies Alpine security fixes (for example OpenSSL) published after the base image was built.
+RUN apk upgrade --no-cache
 COPY deploy/Caddyfile /etc/caddy/Caddyfile
 COPY --from=build /web/dist /srv
